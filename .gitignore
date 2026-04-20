@@ -1,6 +1,6 @@
 # Python
 
-**pycache**/
+__pycache__/
 *.pyc
 
 # Virtual environments
@@ -45,4 +45,10 @@ financial_agentic_benchmark/
 .claude/
 .codex/
 context_as_world/
+refs/
+
+# Trading skill DuckDB
+
+trading/db/*.duckdb
+trading/db/*.duckdb.wal
 
