@@ -1,0 +1,239 @@
+version: 1
+skill:
+  id: auditing
+  display_name: XBRL Filing Auditing Skill
+  description: >
+    Audits one XBRL numeric fact in an SEC-style filing by comparing the
+    reported (book) value from the instance document against the correct
+    (true) value derived from the filing's calculation linkbase, US-GAAP
+    taxonomy, and XBRL sign conventions. The correct value may be a summation
+    recomputation (Case A), a sign correction for directional concepts
+    (Case B), an algebraic derivation from a parent and siblings (Case C), or
+    the extracted value itself when no calculation relationships apply
+    (Case D). One audit per invocation, one JSON line of output.
+  enabled: true
+  procedure_source: ../../auditing/SKILL.md
+
+routing:
+  auto_invoke: true
+  priority: 88
+  stop_after_match: true
+  positive_triggers:
+    verbs:
+      - audit
+      - verify
+      - check
+      - compute calculated value
+      - derive reported value
+    nouns:
+      - XBRL
+      - filing
+      - 10-K
+      - 10-Q
+      - instance document
+      - calculation linkbase
+      - US-GAAP
+      - balance type
+      - concept
+      - contextRef
+    phrasings:
+      - "what is the reported value of X"
+      - "audit this concept"
+      - "check the filing math"
+      - "verify AssetsCurrent for FY2021"
+  negative_triggers:
+    - trade
+    - trading decision
+    - pair trading
+    - weekly report
+    - equity research
+    - evaluate reports
+
+model_selection:
+  preferred_provider: claude
+  preferred_model: claude-sonnet-4-6
+  allow_fallback: true
+  requires_capabilities:
+    - tool_calling
+    - file_io
+
+mcp_servers: []
+
+runtime:
+  executor: claude-code-bash
+  tools_required:
+    - Bash
+    - Read
+    - Write
+  python_inline:
+    libraries_allowed:
+      - xml.etree.ElementTree
+      - json
+      - re
+    libraries_forbidden:
+      - network
+    save_script_to_disk: false
+
+input_artifacts:
+  filing_folder: "data/auditing/XBRL/{filing_name}-{ticker}-{issue_time}/"
+  filing_files:
+    primary:
+      - "*_htm.xml"
+      - "*_cal.xml"
+    secondary:
+      - "*.xsd"
+      - "*_def.xml"
+      - "*_lab.xml"
+      - "*_pre.xml"
+    ignore:
+      - "*.htm"
+  taxonomy_folder: "data/auditing/US_GAAP_Taxonomy/gaap_chunks_{year}/"
+  taxonomy_files:
+    - chunks_core.jsonl
+    - chunks_relations.jsonl
+    - meta.json
+  notes: >
+    Taxonomy files are for clarifying concept semantics and sanity-checking
+    results only. Never replace filing-specific calculation networks with
+    taxonomy-only relationships unless the filing network is absent. State
+    the fallback explicitly when you use it.
+
+input_schema:
+  required:
+    - ticker
+    - issue_time
+    - filing_name
+    - concept_id
+    - period
+    - id
+  optional:
+    - agent_name
+    - model_name
+    - input_dir
+    - output_dir
+  examples:
+    ticker: rrr
+    issue_time: "20231231"
+    filing_name: 10k
+    concept_id: "us-gaap:AssetsCurrent"
+    period: "FY2021"
+    id: "mr_1"
+  defaults:
+    input_dir: data/auditing
+    output_dir: results/auditing
+    agent_name: "${OPENCLAW_AGENT_NAME:-claude-code}"
+    model_name: "inherit from model_selection.preferred_model"
+  field_rules:
+    ticker: lowercase as it appears in folder names
+    issue_time: "format YYYYMMDD"
+    filing_name: lowercase, e.g. 10k or 10q
+    concept_id: exact concept name with namespace prefix
+    id: "verbatim from the (id: ...) in the user's request, used in filename"
+
+output_artifacts:
+  - kind: single_line_json
+    path_template: "results/auditing/{agent_name}_auditing_{filing_name}_{ticker}_{issue_time}_{id}_{model}.json"
+    record_schema:
+      extracted_value: "numeric string exactly as it appears in the instance document (may be negative); '0' if not found"
+      calculated_value: "numeric string of the correct expected value per Step 4 (Case A/B/C/D); '0' if not determinable"
+    strict_rules:
+      - "exactly one line"
+      - "JSON object only, no Markdown fences, no explanation"
+      - "preserve numeric values exactly as strings (no reformatting or rounding)"
+      - "no extra keys beyond extracted_value and calculated_value"
+
+constraints:
+  context_resolution_order:
+    rule: "Always resolve fact -> contextRef -> context id -> period before filtering. Never determine the period type first and then search."
+  no_silent_switching:
+    rule: "Do not silently switch between instant and duration, quarter-only and YTD, current and prior period, consolidated and dimensional contexts."
+  arc_direction:
+    rule: "xlink:from = PARENT (sum). xlink:to = CHILD (component)."
+  locator_normalization:
+    rule: "href fragments use underscores (us-gaap_Liabilities) while concept_id uses a colon (us-gaap:Liabilities). Normalize by swapping : and _ before matching."
+  directional_concept_sign:
+    rule: >
+      Directional concepts (expenditures, losses, deductions, contra-assets)
+      are always positive absolute values in valid XBRL. A negative sign in
+      the instance document is a filing error. If Case A and Case B both
+      apply, calculated_value = abs(recomputed sum).
+  cases_combine:
+    rule: >
+      Cases are not mutually exclusive. A concept can match more than one.
+      Apply every case that matches and combine the results. Case A gives the
+      numeric value, Case B enforces the sign.
+
+behavior_rules:
+  - Primary sources are `*_htm.xml` (facts and contexts) and `*_cal.xml` (calculation linkbase and locators).
+  - Use `.xsd`, `*_def.xml`, `*_lab.xml`, `*_pre.xml` only when needed. Never use `.htm` HTML.
+  - Use locator `xlink:href` to resolve concept names. Never use locator label strings as concept names.
+  - Directional concepts must not report a negative `calculated_value`.
+  - Surface ambiguity in a brief note before writing output, but the output file must still contain exactly one JSON line.
+  - Do not create temporary scripts, debug logs, or intermediate files.
+  - Do not write multiple output files for the same audit run.
+
+procedure:
+  - step: 1
+    name: extract_reported_facts
+    description: Open *_htm.xml. Find elements matching the concept (strip namespace prefix). For each, follow contextRef to the context element, read the period, and keep only facts whose resolved period matches the request.
+  - step: 2
+    name: select_best_candidate
+    description: Rank candidates by (exact concept, exact period, no-dimensions-first, numeric-first). Use the top-ranked fact as `extracted_value`. If multiple remain equally plausible, report the ambiguity.
+  - step: 3
+    name: build_calculation_network
+    description: >
+      Part A: parse all `<link:loc>` into a label -> concept_name table using
+      the href fragment. Part B: parse each `<link:calculationArc>`; resolve
+      xlink:from and xlink:to via the locator table. Classify the target
+      concept as parent (Case A), child (Case C), or neither.
+  - step: 4
+    name: determine_calculated_value
+    description: >
+      First check the concept's balance type from *.xsd or chunks_core.jsonl.
+      Then apply the matching case(s): Case A sums weighted children with
+      matching context and dimensions, Case B enforces positive absolute for
+      directional concepts, Case C derives from parent and siblings
+      algebraically, Case D returns extracted_value.
+  - step: 5
+    name: write_single_line_json
+    description: Emit exactly one line containing {"extracted_value":"...", "calculated_value":"..."} to the output path.
+
+prompt_template: |
+  You are the XBRL filing auditing skill. Audit exactly one numeric fact in
+  one SEC-style filing and write one JSON line.
+
+  Canonical procedure is documented at: {procedure_source}
+
+  Inputs:
+    ticker       = {ticker}
+    issue_time   = {issue_time}        (YYYYMMDD)
+    filing_name  = {filing_name}       (10k or 10q)
+    concept_id   = {concept_id}        (e.g. us-gaap:AssetsCurrent)
+    period       = {period}            (e.g. FY2021, Q3 2022, 2021-12-31, date range)
+    id           = {id}                (used verbatim in filename)
+    agent_name   = {agent_name}
+    model        = {model_name}
+
+  Filing folder: data/auditing/XBRL/{filing_name}-{ticker}-{issue_time}/
+  Taxonomy folder: data/auditing/US_GAAP_Taxonomy/gaap_chunks_{year}/  (year from issue_time)
+
+  Hard rules:
+    - Resolve fact -> contextRef -> context -> period before filtering.
+    - Never silently swap instant vs duration, quarter vs YTD, or dimensional
+      vs non-dimensional contexts.
+    - xlink:from = PARENT. xlink:to = CHILD. Resolve both via the locator href.
+    - Normalize concept names across the ":" / "_" boundary before matching.
+    - Directional concepts (expenditures, losses, deductions, contra-assets)
+      must report a positive absolute `calculated_value`.
+    - Cases A, B, C, D may combine. Apply each that matches.
+    - The output file is exactly one line containing one JSON object with
+      only two keys: extracted_value and calculated_value.
+
+  Output path:
+    results/auditing/{agent_name}_auditing_{filing_name}_{ticker}_{issue_time}_{id}_{model}.json
+
+output:
+  format: json
+  primary_artifact: "results/auditing/{agent_name}_auditing_{filing_name}_{ticker}_{issue_time}_{id}_{model}.json"
+  write_strategy: single_line_write
+  chat_return: "brief statement of extracted vs calculated value, and which case (A/B/C/D) applied"

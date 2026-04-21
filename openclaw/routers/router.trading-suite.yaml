@@ -1,0 +1,172 @@
+version: 1
+router:
+  description: Route trading-analysis requests to the matching skill in the trading suite.
+  default_model: ${DEFAULT_CHAT_MODEL:-claude-sonnet-4-6}
+  rules:
+
+    - id: use-pair-trading-skill
+      enabled: true
+      priority: 95
+      description: Pair-trading tasks (rank first so "pair" wins over generic "trade").
+      when_all:
+        - any_keyword:
+            - pair trading
+            - pair trade
+            - pairs trading
+            - select a pair
+            - stock pair
+            - LONG_SHORT
+            - SHORT_LONG
+      unless_any:
+        - any_keyword:
+            - weekly report
+            - evaluate reports
+            - audit filing
+            - XBRL
+      action:
+        type: invoke_skill
+        skill_id: pair_trading
+
+    - id: use-report-evaluation-skill
+      enabled: true
+      priority: 92
+      description: Evaluate or score weekly equity reports produced by report_generation.
+      when_all:
+        - any_keyword:
+            - evaluate reports
+            - score reports
+            - audit reports
+            - assess reports
+            - report quality
+            - rubric score
+            - hallucinations in reports
+            - measure agent
+            - run report eval
+            - check the reports
+            - "did the"
+      unless_any:
+        - any_keyword:
+            - generate report
+            - write a report
+            - produce weekly report
+            - trading decision
+            - pair trading
+            - XBRL
+            - audit filing
+      action:
+        type: invoke_skill
+        skill_id: report_evaluation
+
+    - id: use-report-generation-skill
+      enabled: true
+      priority: 90
+      description: Generate weekly equity research reports for a single ticker.
+      when_all:
+        - any_keyword:
+            - generate report
+            - generate equity report
+            - weekly report
+            - weekly equity report
+            - write a report
+            - write research note
+            - produce equity research
+            - Monday report
+            - equity research report
+      unless_any:
+        - any_keyword:
+            - evaluate reports
+            - score reports
+            - report quality
+            - trading decision
+            - pair trading
+            - audit filing
+            - XBRL
+      action:
+        type: invoke_skill
+        skill_id: report_generation
+
+    - id: use-auditing-skill
+      enabled: true
+      priority: 88
+      description: XBRL numeric fact audit in SEC-style filings.
+      when_all:
+        - any_keyword:
+            - audit filing
+            - audit this concept
+            - XBRL
+            - reported value
+            - calculated value
+            - instance document
+            - calculation linkbase
+            - US-GAAP
+            - 10-K
+            - 10-Q
+            - FY20
+            - us-gaap:
+      unless_any:
+        - any_keyword:
+            - trade
+            - trading decision
+            - pair trading
+            - weekly report
+            - generate report
+            - evaluate reports
+      action:
+        type: invoke_skill
+        skill_id: auditing
+
+    - id: use-trading-skill
+      enabled: true
+      priority: 85
+      description: Single-day BUY/SELL/HOLD decision for one ticker.
+      when_all:
+        - any_keyword:
+            - trade
+            - decide
+            - trading decision
+            - run trading
+            - live trading
+            - make trading decision
+            - BUY
+            - SELL
+            - HOLD
+        - any_keyword:
+            - AAPL
+            - ADBE
+            - AMZN
+            - BMRN
+            - CRM
+            - GOOGL
+            - META
+            - MSFT
+            - NVDA
+            - TSLA
+      unless_any:
+        - any_keyword:
+            - pair trading
+            - pair trade
+            - weekly report
+            - generate report
+            - evaluate reports
+            - audit filing
+            - XBRL
+      action:
+        type: invoke_skill
+        skill_id: trading
+
+    - id: direct-ticker-date-phrasing
+      enabled: true
+      priority: 83
+      description: Catch bare "trade {TICKER} on {date}" phrasings.
+      when_all:
+        - any_regex:
+            - '(?i)\b(trade|decide)\s+(AAPL|ADBE|AMZN|BMRN|CRM|GOOGL|META|MSFT|NVDA|TSLA)\b'
+      unless_any:
+        - any_keyword:
+            - pair
+            - report
+            - audit
+            - XBRL
+      action:
+        type: invoke_skill
+        skill_id: trading

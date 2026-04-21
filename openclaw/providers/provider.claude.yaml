@@ -1,0 +1,101 @@
+version: 1
+provider:
+  id: claude
+  type: anthropic
+  display_name: Claude (Anthropic API)
+  description: >
+    Claude models from Anthropic via the Messages API. Supports tool use, MCP
+    server auto-loading, prompt caching, and extended thinking. This is the
+    intended backend for procedural skills (trading, pair_trading, auditing,
+    report_generation, report_evaluation) that require tool-calling or file I/O.
+
+connection:
+  base_url: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+  api_key: ${ANTHROPIC_API_KEY}
+  api_version: "2023-06-01"
+  timeout_seconds: 600
+
+models:
+  - id: claude-opus-4-7
+    provider_model_name: claude-opus-4-7
+    display_name: Claude Opus 4.7 (1M context)
+    mode: chat
+    capabilities:
+      input_text: true
+      output_text: true
+      tool_calling: true
+      streaming: true
+      json_mode: false
+      vision: true
+      mcp: true
+      extended_thinking: true
+      prompt_caching: true
+    context_window: 1000000
+    max_output_tokens: 32000
+    default_parameters:
+      temperature: 1.0
+      max_tokens: 16000
+
+  - id: claude-sonnet-4-6
+    provider_model_name: claude-sonnet-4-6
+    display_name: Claude Sonnet 4.6
+    mode: chat
+    capabilities:
+      input_text: true
+      output_text: true
+      tool_calling: true
+      streaming: true
+      json_mode: false
+      vision: true
+      mcp: true
+      extended_thinking: true
+      prompt_caching: true
+    context_window: 200000
+    max_output_tokens: 64000
+    default_parameters:
+      temperature: 1.0
+      max_tokens: 16000
+
+  - id: claude-haiku-4-5
+    provider_model_name: claude-haiku-4-5-20251001
+    display_name: Claude Haiku 4.5
+    mode: chat
+    capabilities:
+      input_text: true
+      output_text: true
+      tool_calling: true
+      streaming: true
+      json_mode: false
+      vision: true
+      mcp: true
+      extended_thinking: false
+      prompt_caching: true
+    context_window: 200000
+    max_output_tokens: 8192
+    default_parameters:
+      temperature: 1.0
+      max_tokens: 4096
+
+features:
+  prompt_caching:
+    enabled: true
+    default_ttl: 5m
+    recommended_for:
+      - long system prompts
+      - static skill procedure blocks
+      - repeated MCP tool schemas
+  tool_use_loop:
+    enabled: true
+    max_iterations: 50
+  mcp_autoload:
+    enabled: true
+    discovery: via_skill_mcp_servers_field
+
+fallback:
+  enabled: true
+  fallback_model: ${DEFAULT_FALLBACK_MODEL:-claude-sonnet-4-6}
+
+notes:
+  - Set ANTHROPIC_API_KEY in the environment before running any skill that routes here.
+  - The `mcp_autoload` feature reads `mcp_servers` from each skill YAML and spawns the declared MCP servers at invocation time.
+  - Opus 4.7 exposes a 1M-context beta. Use for long-context skills like report_evaluation when all reports plus parquet context must fit in a single turn.

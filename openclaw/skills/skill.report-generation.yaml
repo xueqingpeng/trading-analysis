@@ -1,0 +1,248 @@
+version: 1
+skill:
+  id: report_generation
+  display_name: Weekly Equity Research Report Generation Skill
+  description: >
+    Generates structured weekly equity research reports for a single stock
+    every Monday over a 3-month window (2025-03-01 to 2025-05-31) using
+    parquet data that contains price, news, 10-K, 10-Q, and momentum fields.
+    Each report covers the prior calendar week, computes 11 required metrics,
+    and issues a graduated Strong BUY / BUY / HOLD / SELL / Strong SELL
+    rating with rationale. Produces ~13 individual Markdown files per run,
+    stored inside a run-specific subfolder.
+  enabled: true
+  procedure_source: ../../report_generation/SKILL.md
+
+routing:
+  auto_invoke: true
+  priority: 87
+  stop_after_match: true
+  positive_triggers:
+    verbs:
+      - generate equity report
+      - produce weekly report
+      - write research note
+      - produce equity research
+      - write a report
+      - generate weekly reports
+    nouns:
+      - weekly report
+      - equity research report
+      - research note
+      - weekly equity report
+      - Monday report
+    tickers:
+      - AAPL
+      - ADBE
+      - AMZN
+      - BMRN
+      - CRM
+      - GOOGL
+      - META
+      - MSFT
+      - NVDA
+      - TSLA
+  negative_triggers:
+    - trading decision
+    - BUY SELL HOLD single day
+    - pair trading
+    - audit filing
+    - XBRL
+    - evaluate reports
+    - score reports
+
+model_selection:
+  preferred_provider: claude
+  preferred_model: claude-sonnet-4-6
+  allow_fallback: true
+  requires_capabilities:
+    - tool_calling
+    - file_io
+
+mcp_servers: []
+
+runtime:
+  executor: claude-code-bash
+  tools_required:
+    - Bash
+    - Read
+    - Write
+  python_inline:
+    libraries_allowed:
+      - pandas
+      - numpy
+    save_script_to_disk: false
+
+input_artifacts:
+  parquet_template: "data/trading/{TICKER}-00000-of-00001.parquet"
+  parquet_schema:
+    date: datetime
+    asset: string
+    prices: "float64 (NaN on non-trading days)"
+    news: "list[string] or numpy.ndarray"
+    10k: "list[string] or numpy.ndarray"
+    10q: "list[string] or numpy.ndarray"
+    momentum: "up | down | neutral"
+  list_field_handling: "Use `isinstance(val, (list, np.ndarray)) and len(val) > 0`. Do not use `isinstance(val, list)` alone."
+
+input_schema:
+  required:
+    - ticker
+  optional:
+    - input_dir
+    - output_dir
+    - agent_name
+    - model_name
+  tickers_whitelist:
+    - AAPL
+    - ADBE
+    - AMZN
+    - BMRN
+    - CRM
+    - GOOGL
+    - META
+    - MSFT
+    - NVDA
+    - TSLA
+  defaults:
+    input_dir: data/trading
+    output_dir: results/report_generation
+    agent_name: "${OPENCLAW_AGENT_NAME:-claude-code}"
+    model_name: "inherit from model_selection.preferred_model"
+
+context_packing:
+  include_in_order:
+    - skill_procedure
+    - ticker
+    - visible_history_up_to_M
+    - prior_calendar_week_rows
+    - prior_week_news_including_weekends
+    - filings_up_to_M
+    - report_template
+  max_context_chars: 80000
+  truncation_policy: keep_current_monday_context
+
+output_artifacts:
+  - kind: one_markdown_file_per_monday
+    run_folder_template: "results/report_generation/{agent_name}_report_generation_{TICKER}_{model}/"
+    file_template: "{agent_name}_report_generation_{TICKER}_{YYYYMMDD}_{model}.md"
+    example:
+      folder: "results/report_generation/claude-code_report_generation_AAPL_claude-sonnet-4-6/"
+      file: "claude-code_report_generation_AAPL_20250303_claude-sonnet-4-6.md"
+    total_files: "~13 per 3-month run"
+    filename_sanitization:
+      rule: "replace any character that is not alphanumeric, '-', or '_' with '_'"
+      lowercase: [model]
+
+report_structure:
+  sections:
+    - { id: 1, name: "Executive Summary", length: "3 to 5 sentences" }
+    - { id: 2, name: "Investment Rating & Thesis", length: "rating plus 2 to 3 thesis bullets" }
+    - { id: 3, name: "Weekly Price Performance & Technical Indicators", length: "11-row metrics table" }
+    - { id: 4, name: "News & Catalysts", length: "3 to 5 bullets or 'No news this week.'" }
+    - { id: 5, name: "Earnings & Filings Update", length: "summary or 'No filings available as of {report_date}.'" }
+    - { id: 6, name: "Valuation Snapshot", length: "paragraph" }
+    - { id: 7, name: "Risk Factors", length: "2 to 4 specific bullets" }
+    - { id: 8, name: "Recommendation & Outlook", length: "restated rating plus 2 to 3 sentences" }
+  rating_scale:
+    - { label: "Strong BUY", emoji: "⬆⬆" }
+    - { label: "BUY", emoji: "⬆" }
+    - { label: "HOLD", emoji: "➡" }
+    - { label: "SELL", emoji: "⬇" }
+    - { label: "Strong SELL", emoji: "⬇⬇" }
+  required_metrics:
+    - week_open
+    - week_close
+    - week_high
+    - week_low
+    - weekly_return_pct
+    - ma_4week
+    - ma_1week
+    - price_vs_ma4
+    - return_4week_pct
+    - weekly_volatility
+    - momentum
+  metric_formatting:
+    prices: "$ prefix, 2 decimal places"
+    percentages: "sign included, 2 decimal places, % suffix"
+
+constraints:
+  no_look_ahead:
+    rule: "On Monday M, slice the dataframe to rows where date <= M before any reasoning or computation."
+  weekend_holiday_news:
+    rule: "Include news from the full 7-day calendar period (Monday to Sunday of the prior week), even for days with NaN prices."
+  holiday_monday_fallback:
+    rule: "If a Monday is not a trading day in the dataset, use the next available trading day in that week as the report date."
+  moving_average_defaults:
+    rule: "ma_4week uses the 20 trading days ending on the last trading day of the prior week (use fewer if history is short). ma_1week uses trading days within the prior calendar week."
+  hold_is_not_default:
+    rule: "HOLD is used only when signals are genuinely mixed. Apply analytical judgment to weigh price, momentum, news, and filings."
+
+behavior_rules:
+  - All data comes from the ticker's parquet file. Never call external APIs.
+  - Never use data beyond the Monday the report is written.
+  - Each report must contain all 8 sections with exact headers `### 1.` through `### 8.`.
+  - The 11-row metrics table is required in every report, even with short history.
+  - Write each `.md` file immediately after generating that Monday's report. Do not accumulate and dump at the end.
+  - Do not combine weekly reports into a single file. Do not output raw JSON.
+  - Do not write files directly to `results/report_generation/`. Every file goes inside the run-specific subfolder.
+  - Do not create temporary scripts, notebooks, debug logs, or intermediate files.
+
+procedure:
+  - step: 1
+    name: load_parquet
+    description: Read the ticker parquet, convert `date` to datetime, sort ascending.
+  - step: 2
+    name: enumerate_mondays
+    description: List every Monday in 2025-03-01 to 2025-05-31. For holidays, resolve to the next trading day.
+  - step: 3
+    name: loop_over_mondays
+    description: >
+      For each Monday M, slice df to `date <= M`. Identify the prior
+      calendar week (7-day Mon to Sun). Compute all 11 metrics. Assemble the
+      full 8-section Markdown in memory. Write the file immediately. Move to
+      the next Monday.
+  - step: 4
+    name: verify_output_folder
+    description: Ensure the run-specific subfolder exists before the first write.
+
+prompt_template: |
+  You are the weekly equity research report generation skill. Produce one
+  Markdown report per Monday in 2025-03-01 to 2025-05-31 for ticker `{ticker}`.
+
+  Canonical procedure is documented at: {procedure_source}
+
+  Inputs:
+    ticker      = {ticker}
+    input_dir   = {input_dir}
+    output_dir  = {output_dir}
+    agent_name  = {agent_name}
+    model       = {model_name}
+
+  Data file: {input_dir}/{ticker}-00000-of-00001.parquet
+
+  For each Monday M:
+    1. Slice to date <= M (no future data).
+    2. Compute the prior calendar week (Mon to Sun). Use trading-day rows for
+       price metrics and all rows for news.
+    3. Compute all 11 required metrics (see report_structure.required_metrics).
+    4. Assemble the full 8-section Markdown (see report_structure.sections).
+    5. Write the file immediately to:
+         {output_dir}/{agent_name}_report_generation_{ticker}_{model}/{agent_name}_report_generation_{ticker}_{YYYYMMDD}_{model}.md
+
+  Rating scale (include the emoji in the header):
+    ⬆⬆ Strong BUY, ⬆ BUY, ➡ HOLD, ⬇ SELL, ⬇⬇ Strong SELL
+
+  Hard rules:
+    - Never use data beyond M.
+    - All 8 sections required in every report. Do not rename or reorder.
+    - The 11-metric table is required even when history is short.
+    - News section must cover the full 7-day calendar week (include weekends and holidays).
+    - Write each file immediately. Do not combine into a single file.
+    - Do not emit raw JSON or intermediate scripts to disk.
+
+output:
+  format: markdown_per_monday
+  primary_artifact_folder: "results/report_generation/{agent_name}_report_generation_{ticker}_{model}/"
+  write_strategy: one_file_per_monday_immediate
+  chat_return: "count of reports written, date range covered, and the folder path"

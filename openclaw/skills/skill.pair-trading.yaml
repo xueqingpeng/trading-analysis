@@ -1,0 +1,232 @@
+version: 1
+skill:
+  id: pair_trading
+  display_name: Pair Trading Skill
+  description: >
+    Executes a daily pair-trading decision task over a 3-month window
+    (2025-03-01 to 2025-05-31) using parquet input files for a fixed pool of
+    10 stocks. On the first trading day, selects one pair from the pool using
+    only information visible up to that day (emphasis on first-day news).
+    Then trades the selected pair day by day chronologically with strict
+    no-look-ahead discipline, writing one final structured JSON to
+    results/pair_trading/.
+  enabled: true
+  procedure_source: ../../pair_trading/SKILL.md
+
+routing:
+  auto_invoke: true
+  priority: 92
+  stop_after_match: true
+  positive_triggers:
+    verbs:
+      - run pair trading
+      - execute pair trading
+      - do pair trading
+      - process pair trading
+      - select a pair
+      - trade a pair
+    nouns:
+      - pair trading task
+      - pair trading simulation
+      - pair trading experiment
+      - stock pair
+      - pair trade
+    actions:
+      - LONG_SHORT
+      - SHORT_LONG
+  negative_triggers:
+    - single-stock decision
+    - weekly report
+    - equity research
+    - audit filing
+    - XBRL
+    - evaluate reports
+
+model_selection:
+  preferred_provider: claude
+  preferred_model: claude-sonnet-4-6
+  allow_fallback: true
+  requires_capabilities:
+    - tool_calling
+    - file_io
+
+mcp_servers: []
+
+runtime:
+  executor: claude-code-bash
+  tools_required:
+    - Bash
+    - Read
+    - Write
+  python_inline:
+    libraries_allowed:
+      - pandas
+      - numpy
+    save_script_to_disk: false
+
+input_artifacts:
+  stock_pool:
+    - NVDA
+    - TSLA
+    - AAPL
+    - AMZN
+    - GOOGL
+    - META
+    - MSFT
+    - BMRN
+    - CRM
+    - ADBE
+  parquet_template: "data/trading/{TICKER}-00000-of-00001.parquet"
+  parquet_schema:
+    date: "string YYYY-MM-DD"
+    asset: string
+    prices: float64
+    news: "list[string] or numpy.ndarray"
+    10k: "list[string] or numpy.ndarray"
+    10q: "list[string] or numpy.ndarray"
+    momentum: "up | down | neutral"
+  list_field_handling: >
+    After read_parquet the list columns may be numpy.ndarray, not list. Use
+    `isinstance(val, (list, np.ndarray)) and len(val) > 0` for emptiness
+    checks. Never use `isinstance(val, list)` alone.
+
+input_schema:
+  required: []
+  optional:
+    - input_dir
+    - output_dir
+    - agent_name
+    - model_name
+  defaults:
+    input_dir: data/trading
+    output_dir: results/pair_trading
+    agent_name: "${OPENCLAW_AGENT_NAME:-claude-code}"
+    model_name: "inherit from model_selection.preferred_model"
+
+context_packing:
+  include_in_order:
+    - skill_procedure
+    - stock_pool
+    - pair_selection_window
+    - target_window
+    - first_day_cross_stock_news
+    - fixed_pair_chronological_rows
+  max_context_chars: 120000
+  truncation_policy: keep_selected_pair_and_current_day
+
+output_artifacts:
+  - kind: single_json_write_at_end
+    path_template: "results/pair_trading/{agent_name}_pair_trading_{pair}_{model}.json"
+    document_shape:
+      status:
+        enum: [completed, partial]
+      start_date: string
+      end_date: string
+      model: string
+      recommendations: array
+    record_schema:
+      pair: "string, fixed order, e.g. 'META, MSFT'"
+      date: "YYYY-MM-DD"
+      price: "object mapping each stock in the pair to its prices value for that day"
+      recommended_action:
+        enum: [LONG_SHORT, SHORT_LONG, HOLD]
+      trajectory: "2 to 3 sentence reasoning"
+    filename_sanitization:
+      rule: "replace any character that is not alphanumeric, '-', or '_' with '_'"
+      lowercase: [model]
+
+constraints:
+  target_window:
+    start: "2025-03-01"
+    end: "2025-05-31"
+    rule: Process only trading days present in the dataset within this window.
+  pair_selection_window:
+    start: "2025-01-01"
+    end: "2025-02-28"
+    rule: >
+      Pair selection uses only information from this pre-window plus the first
+      actual trading day in the target window.
+  pair_selection_immutability:
+    rule: >
+      Select the pair exactly once on the first actual trading day in the
+      target window. The selected pair must not change for any subsequent day.
+  no_look_ahead:
+    rule: >
+      On each trading day t, slice every ticker's rows to `date <= t` before
+      reasoning. Never pre-scan later rows. Never use future returns, future
+      spread behavior, or future news to choose or revise the pair.
+  skip_misaligned_days:
+    rule: >
+      If either stock in the selected pair has no row on day t, skip that day
+      (do not write a HOLD record for it).
+  fixed_pair_order:
+    rule: >
+      The pair string is written in the same fixed order throughout the file,
+      e.g. "META, MSFT". LONG_SHORT means long the first stock, short the
+      second. SHORT_LONG is the reverse. HOLD means no directional exposure.
+
+behavior_rules:
+  - Load all 10 parquet files before the pair-selection day.
+  - News across all 10 stocks on the first trading day drives pair selection. Momentum and pre-window filings are supporting signals.
+  - Use only lightweight in-loop heuristics based on visible history. No fitting models on the full future window.
+  - Each daily `trajectory` is 2 to 3 sentences grounded in the data visible on day t, naming the long leg and short leg explicitly.
+  - Write the output JSON exactly once at the end, not incrementally. Accumulate decisions in memory.
+  - Do not create temporary scripts, notebooks, debug logs, or intermediate files.
+
+procedure:
+  - step: 1
+    name: load_all_parquets
+    description: Read all 10 stock parquet files into memory, sorted by date.
+  - step: 2
+    name: determine_first_trading_day
+    description: Find the earliest date in the target window that actually appears in the dataset.
+  - step: 3
+    name: select_pair
+    description: >
+      Using only information visible on the first trading day (pre-window news,
+      first-day news across all 10 stocks, momentum, visible filings), pick
+      one pair. Record it. Never change it.
+  - step: 4
+    name: chronological_loop
+    description: >
+      For each trading day t in the target window, slice both tickers to
+      `date <= t`, gather visible signals, decide LONG_SHORT | SHORT_LONG |
+      HOLD, append to the in-memory recommendations list.
+  - step: 5
+    name: finalize_and_write
+    description: >
+      After the loop, set status (completed or partial) and write a single
+      JSON file to the output path.
+
+prompt_template: |
+  You are the pair-trading skill. Execute a daily pair-trading simulation for
+  the fixed 10-stock pool over 2025-03-01 to 2025-05-31. Produce one JSON file
+  at the end. Never look ahead.
+
+  Canonical procedure is documented at: {procedure_source}
+
+  Stock pool: NVDA, TSLA, AAPL, AMZN, GOOGL, META, MSFT, BMRN, CRM, ADBE
+  Parquet files: data/trading/{{TICKER}}-00000-of-00001.parquet
+
+  Two stages:
+    1. Pair selection (first trading day only): pick one pair using only
+       visible information up to the first actual trading day in the target
+       window. Emphasis: first-day news across all 10 stocks.
+    2. Pair trading: for each trading day t in the window, slice to date <= t,
+       decide LONG_SHORT | SHORT_LONG | HOLD for the fixed pair, write a 2 to
+       3 sentence trajectory naming the long leg and short leg.
+
+  Hard rules:
+    - Selection must be finalized on day 1 and never revised.
+    - The pair string is written in fixed order throughout the file.
+    - Skip days where either pair stock has no row.
+    - Write the JSON exactly once at the end. No partial files.
+    - Do not save Python scripts or debug logs to disk.
+
+  Output path: results/pair_trading/{agent_name}_pair_trading_{pair}_{model}.json
+
+output:
+  format: json
+  primary_artifact: "results/pair_trading/{agent_name}_pair_trading_{pair}_{model}.json"
+  write_strategy: single_write_at_end
+  chat_return: "brief summary of selected pair, date range, and total trading days processed"

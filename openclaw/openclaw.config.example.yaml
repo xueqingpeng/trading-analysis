@@ -1,0 +1,22 @@
+version: 1
+includes:
+  providers:
+    - ./providers/provider.claude.yaml
+  skills:
+    - ./skills/skill.trading.yaml
+    - ./skills/skill.pair-trading.yaml
+    - ./skills/skill.auditing.yaml
+    - ./skills/skill.report-generation.yaml
+    - ./skills/skill.report-evaluation.yaml
+  routers:
+    - ./routers/router.trading-suite.yaml
+
+model:
+  provider: claude
+  model: claude-sonnet-4-6
+
+notes:
+  - Ensure ANTHROPIC_API_KEY is set for the Claude provider.
+  - The trading skill loads a DuckDB via the `trading_mcp` MCP server. Set TRADING_DB_PATH or use the default trading/db/trading_env.duckdb (must be populated out of band).
+  - All five skills require tool_calling and file I/O, so only a Claude model can execute them.
+  - Trading-suite router priorities are pair_trading (95) > report_evaluation (92) > report_generation (90) > auditing (88) > trading (85), so "pair" wins over bare "trade" and "evaluate reports" wins over bare "report".
