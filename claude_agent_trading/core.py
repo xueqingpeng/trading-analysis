@@ -39,6 +39,7 @@ def run_agent(
     env: dict[str, str] | None = None,
     permission_mode: str = "bypassPermissions",
     setting_sources: list[str] | None = None,
+    mcp_servers: dict | str | Path | None = None,
     on_assistant_text: Callable[[str], None] | None = None,
     on_thinking: Callable[[str], None] | None = None,
     on_tool_use: Callable[[str, dict], None] | None = None,
@@ -73,7 +74,7 @@ def run_agent(
     resolved_model = model or resolve_model()
 
     # Build environment: provider credentials + user env
-    agent_env = resolve_provider_env()
+    agent_env = resolve_provider_env(model=resolved_model)
     if env:
         agent_env.update(env)
 
@@ -86,7 +87,7 @@ def run_agent(
             else:
                 logger.warning("Agent stderr: %s", line)
 
-    options = ClaudeAgentOptions(
+    options_kwargs = dict(
         model=resolved_model,
         permission_mode=permission_mode,
         cwd=resolved_cwd,
@@ -96,6 +97,9 @@ def run_agent(
         setting_sources=setting_sources or ["project"],
         stderr=_on_stderr,
     )
+    if mcp_servers is not None:
+        options_kwargs["mcp_servers"] = mcp_servers
+    options = ClaudeAgentOptions(**options_kwargs)
     if max_thinking_tokens is not None:
         options.max_thinking_tokens = max_thinking_tokens
 

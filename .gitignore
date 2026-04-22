@@ -42,7 +42,7 @@ runs/
 # Data
 
 financial_agentic_benchmark/
-.claude/
 .codex/
 context_as_world/
 
+!.claude

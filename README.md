@@ -104,9 +104,10 @@ print(f"Cost: ${result.agent_result.cost_usd:.4f}")
 ## 项目结构
 
 ```
-claude-agent-trading/
+trading-analysis/
 ├── .claude/skills/          # Agent SDK 自动发现的 skill 定义
-│   ├── trading/SKILL.md
+│   ├── trading/             # SKILL.md + scripts/ (MCP server, upsert_decision.py, …)
+│   ├── pair_trading/SKILL.md
 │   ├── report_generation/SKILL.md
 │   ├── report_evaluation/SKILL.md
 │   └── auditing/SKILL.md
@@ -114,6 +115,7 @@ claude-agent-trading/
 │   ├── core.py              # Agent SDK 调用封装
 │   ├── benchmark.py         # 任务定义与 prompt 构建
 │   ├── benchmark_cli.py     # CLI 参数解析
+│   ├── trading_daily.py     # 单日 trading skill 的 daily-loop orchestrator
 │   └── providers.py         # API key / .env 加载
 ├── tests/
 ├── run_benchmark.py         # 入口脚本

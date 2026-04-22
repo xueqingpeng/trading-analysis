@@ -6,14 +6,22 @@ import argparse
 import json
 import sys
 from dataclasses import asdict
+from datetime import date
+from pathlib import Path
 
 from .benchmark import (
     BatchRunResult,
     BenchmarkTask,
     BenchmarkRunResult,
+    DEFAULT_PROJECT_ROOT,
     load_tasks_file,
     run_benchmark_batch,
     run_benchmark_task,
+)
+from .trading_daily import (
+    TradingDailyConfig,
+    TradingRangeResult,
+    run_trading_range,
 )
 
 
@@ -29,11 +37,11 @@ def main() -> None:
     batch_parser.add_argument("--tasks-file", required=True, help="Path to JSONL task file")
     batch_parser.add_argument("--fail-fast", action="store_true", help="Stop after the first failed task")
 
-    trading_parser = subparsers.add_parser("trading", help="Run the trading skill")
-    _add_single_task_common_args(trading_parser)
-    trading_parser.add_argument("--ticker", required=True, help="Ticker symbol, e.g. TSLA")
-    trading_parser.add_argument("--data-root", default=None, help="Trading parquet directory")
-    trading_parser.add_argument("--output-root", default=None, help="Output directory for result JSON")
+    trading_parser = subparsers.add_parser(
+        "trading",
+        help="Drive the single-day trading skill once per day over a date range",
+    )
+    _add_trading_daily_args(trading_parser)
 
     report_gen_parser = subparsers.add_parser(
         "report-generation",
@@ -84,6 +92,13 @@ def main() -> None:
             sys.exit(1)
         return
 
+    if args.command == "trading":
+        trading_result = _run_trading_from_args(args, callbacks)
+        _emit_trading_range_result(trading_result, as_json=args.json)
+        if trading_result.config.fail_fast and trading_result.num_errors > 0:
+            sys.exit(1)
+        return
+
     task = _task_from_args(args)
     result = run_benchmark_task(task, **callbacks)
     _emit_result(result, as_json=args.json)
@@ -128,7 +143,7 @@ def _task_from_args(args: argparse.Namespace) -> BenchmarkTask:
         "max_budget_usd": args.max_budget,
     }
 
-    if task_type in {"trading", "report_generation"}:
+    if task_type == "report_generation":
         payload.update(
             {
                 "ticker": args.ticker,
@@ -199,6 +214,110 @@ def _emit_result(result: BenchmarkRunResult | BatchRunResult, *, as_json: bool) 
     print(
         f"\n--- Cost: ${ar.cost_usd:.4f} | Turns: {ar.turns} | Duration: {ar.duration_ms}ms ---",
         file=sys.stderr,
+    )
+
+
+# ------------------------ trading (daily-loop) ------------------------
+
+def _add_trading_daily_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--symbol", required=True, help="Stock symbol, e.g. TSLA")
+    parser.add_argument("--start", required=True, help="Start date YYYY-MM-DD (inclusive)")
+    parser.add_argument("--end", required=True, help="End date YYYY-MM-DD (inclusive)")
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="Directory the skill writes the result JSON into each day "
+             "(passed to upsert_decision.py via --output-root)",
+    )
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Path to the DuckDB file the MCP server reads from",
+    )
+    parser.add_argument("--model", default=None, help="Claude model override")
+    parser.add_argument("--max-turns", type=int, default=30, help="Agent max turns per day")
+    parser.add_argument(
+        "--max-budget",
+        type=float,
+        default=1.0,
+        help="Per-day cost cap in USD (default 1.0)",
+    )
+    parser.add_argument(
+        "--skip-weekends",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip Sat/Sun before invoking the agent (default on; market holidays handled by the skill)",
+    )
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Stop after the first day that returns an error",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Print assistant and tool events to stderr",
+    )
+    parser.add_argument("--json", action="store_true", help="Print the final result as JSON")
+
+
+def _run_trading_from_args(
+    args: argparse.Namespace, callbacks: dict[str, object]
+) -> TradingRangeResult:
+    try:
+        start = date.fromisoformat(args.start)
+        end = date.fromisoformat(args.end)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid --start/--end (expected YYYY-MM-DD): {exc}")
+
+    if end < start:
+        raise SystemExit(f"--end ({end}) must be >= --start ({start})")
+
+    config = TradingDailyConfig(
+        symbol=args.symbol,
+        start=start,
+        end=end,
+        output_dir=Path(args.output).expanduser().resolve(),
+        db_path=Path(args.db_path).expanduser().resolve(),
+        project_root=DEFAULT_PROJECT_ROOT.resolve(),
+        model=args.model,
+        max_turns=args.max_turns,
+        max_budget_usd=args.max_budget,
+        skip_weekends=args.skip_weekends,
+        fail_fast=args.fail_fast,
+    )
+
+    day_callbacks = {
+        "on_day_start": lambda d: print(f"[day] {d} → invoking agent", file=sys.stderr),
+        "on_day_complete": lambda r: print(
+            f"[day] {r.date} {'ERROR' if r.agent_result.is_error else 'OK'} "
+            f"cost=${r.agent_result.cost_usd:.4f} turns={r.agent_result.turns} "
+            f"→ {r.output_path or '(no output file)'}",
+            file=sys.stderr,
+        ),
+    }
+    return run_trading_range(config, **callbacks, **day_callbacks)
+
+
+def _emit_trading_range_result(
+    result: TradingRangeResult, *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+
+    print(f"Trading range: {result.config.symbol} "
+          f"{result.config.start} → {result.config.end}")
+    for d in result.per_day:
+        status = "ERROR" if d.agent_result.is_error else "OK"
+        dest = str(d.output_path) if d.output_path else "(no output)"
+        print(
+            f"  {d.date}  {status:<5}  ${d.agent_result.cost_usd:.4f}  "
+            f"turns={d.agent_result.turns}  → {dest}"
+        )
+    print(
+        f"\nTotal: {len(result.per_day)} day(s), "
+        f"{result.num_errors} error(s), "
+        f"${result.total_cost_usd:.4f}"
     )
 
 

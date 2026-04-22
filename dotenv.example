@@ -16,8 +16,10 @@ ANTHROPIC_API_KEY=sk-ant-...
 # ── Base URL (proxy / custom endpoint) ────────────────
 # ANTHROPIC_BASE_URL=https://your-proxy.example.com
 
-# ── Small/fast model (proxy mode) ────────────────────
-# Claude CLI internally calls haiku for title/compact.
-# When using a proxy to OpenAI/Gemini, set this to a cheap model
-# that your proxy supports, otherwise those calls will 404.
-# ANTHROPIC_SMALL_FAST_MODEL=gpt-4.1-mini
+# ── Model aliases (haiku/sonnet/opus/subagent) ───────
+# providers.py automatically pins all four aliases to the main CLAUDE_MODEL,
+# so internal Claude CLI calls (compact/title/plan/subagent) use the same
+# model as the top-level agent. This is what lets the proxy route every call
+# to the same third-party endpoint without 404-ing on haiku/opus built-ins.
+# ANTHROPIC_SMALL_FAST_MODEL is deprecated; we set ANTHROPIC_DEFAULT_HAIKU_MODEL
+# (and _SONNET_ / _OPUS_ / CLAUDE_CODE_SUBAGENT_MODEL) automatically.
