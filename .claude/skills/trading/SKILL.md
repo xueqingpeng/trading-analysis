@@ -33,7 +33,8 @@ The user invocation specifies:
 1. **`SYMBOL`** — one of the 8 supported symbols:
    `AAPL`, `ADBE`, `AMZN`, `GOOGL`, `META`, `MSFT`, `NVDA`, `TSLA`
 2. **`TARGET_DATE`** — the trading day to decide on, `YYYY-MM-DD`. **Optional.**
-   If omitted, call `get_latest_date(symbol=SYMBOL)` and use the returned date.
+   If omitted, call `is_trading_day(SYMBOL, <your best guess>)` and use the
+   returned `latest_date_in_db`.
 
 Typical user phrasings:
 - `trade AAPL on 2025-03-05`
@@ -45,23 +46,19 @@ Typical user phrasings:
 ## Data access — DuckDB via MCP
 
 Tools on the `trading_mcp` server. **Prefer the list/get pair + `is_trading_day`
-(marked ⭐) — they keep individual tool results small and let the agent fetch
-detail on demand. The bulk tools (`get_news` / `get_filings`) are kept as a
-fallback but each call can exceed Claude CLI's inline-result size limit,
-forcing the result onto disk.**
+(marked `[preferred]`) — they keep individual tool results small and let the
+agent fetch detail on demand. Bulk returns of full news highlights or filing
+bodies can exceed the model's context limit.**
 
 | Tool | Purpose |
 |---|---|
 | `get_prices(symbol, date_start, date_end)` | Rows `{symbol, date, open, high, low, close, adj_close, volume}` in the range. `adj_close` is the canonical trading price. |
-| ⭐ `is_trading_day(symbol, target_date)` | Returns `{is_trading_day, reason, prev_trading_day, prev_trading_day_adj_close, latest_date_in_db, should_upsert}`. `reason ∈ {'trading_day','weekend','holiday','not_loaded'}`. Use this **first** every day — it replaces weekday checks, missing-row checks, and `get_latest_date`. |
-| ⭐ `list_news(symbol, date_start, date_end)` | Compact news metadata: `{symbol, date, id, title, url}` — no `highlights`. Use this first to scan headlines. |
-| ⭐ `get_news_by_id(symbol, id)` | Full article for one id: `{symbol, date, id, title, url, highlights}`. Call after `list_news` for the relevant ones. |
-| ⭐ `list_filings(symbol, date_start, date_end, document_type?)` | Compact filings metadata: `{symbol, date, document_type, mda_chars, risk_chars}` — no content. Use to decide if/which section is worth reading. |
-| ⭐ `get_filing_section(symbol, date, document_type, section, offset=0, limit=None)` | Fetch one section (`'mda'` or `'risk'`) of a specific filing. Omit `limit` for the whole section; use `offset/limit` to paginate long sections. Returns `{content, total_chars, offset, returned_chars, has_more, …}`. |
+| `[preferred]` `is_trading_day(symbol, target_date)` | Returns `{is_trading_day, reason, prev_trading_day, prev_trading_day_adj_close, latest_date_in_db, should_upsert}`. `reason ∈ {'trading_day','weekend','holiday','not_loaded'}`. Use this **first** every day — it replaces weekday checks and missing-row checks, and exposes the latest loaded date. |
+| `[preferred]` `list_news(symbol, date_start, date_end)` | Compact news metadata: `{symbol, date, id, title, url}` — no `highlights`. Use this first to scan headlines. |
+| `[preferred]` `get_news_by_id(symbol, id)` | Full article for one id: `{symbol, date, id, title, url, highlights}`. Call after `list_news` for the relevant ones. |
+| `[preferred]` `list_filings(symbol, date_start, date_end, document_type?)` | Compact filings metadata: `{symbol, date, document_type, mda_chars, risk_chars}` — no content. Use to decide if/which section is worth reading. |
+| `[preferred]` `get_filing_section(symbol, date, document_type, section, offset=0, limit=None)` | Fetch one section (`'mda'` or `'risk'`) of a specific filing. Omit `limit` for the whole section; use `offset/limit` to paginate long sections. Returns `{content, total_chars, offset, returned_chars, has_more, …}`. |
 | `get_indicator(symbol, date_start, date_end, indicator, length?)` | Computes a technical indicator. `indicator` ∈ {`ma`, `rsi`, `bbands`, `macd`}. Optional — use only if indicators help your decision. |
-| `get_latest_date(symbol)` | Latest trading date in DB. Superseded by `is_trading_day` — rarely needed now. |
-| `get_news(symbol, date_start, date_end)` | **Fallback.** Full news rows incl. `highlights` — can exceed CLI inline-result limits. Prefer `list_news` + `get_news_by_id`. |
-| `get_filings(symbol, date_start, date_end, document_type?)` | **Fallback.** Full filing rows incl. `mda_content` + `risk_content` — typically hundreds of KB per call. Prefer `list_filings` + `get_filing_section`. |
 
 ### Writing the result — `upsert_decision.py` (CLI, not MCP)
 
@@ -89,9 +86,8 @@ this is live or a historical replay — the skill doesn't know, and shouldn't
 care). Either way, **your queries must not request data beyond `TARGET_DATE`**:
 
 - For every data tool (`get_prices` / `list_news` / `get_news_by_id` /
-  `list_filings` / `get_filing_section` / `get_indicator` and the fallback
-  bulk tools): any `date_end` / filing `date` / news date must be
-  `<= TARGET_DATE`.
+  `list_filings` / `get_filing_section` / `get_indicator`): any `date_end` /
+  filing `date` / news date must be `<= TARGET_DATE`.
 - `date_start` can be as far back as you want — historical context is always safe.
 
 This keeps the decision valid under any data population policy.
@@ -274,7 +270,7 @@ date's record (lets the caller re-run one day).
    'macd' | 'ma' | 'bbands')` if a technical signal helps.
 6. Decide `action` based on the data you actually fetched.
 7. Run `python3 .claude/skills/trading/scripts/upsert_decision.py` via the
-   Bash tool with the 6 required flags. Don't write inline Python.
+   Bash tool with the 5 required flags. Don't write inline Python.
 
 One record in, one record out. The caller decides when to mark `status` as
 `completed` — you always leave it `in_progress`.
