@@ -3,6 +3,10 @@
     "trading_mcp": {
       "command": "python3",
       "args": ["trading/mcp/trading_mcp.py"]
+    },
+    "pair_trading_mcp": {
+      "command": "python3",
+      "args": ["pair_trading/mcp/pair_trading_mcp.py"]
     }
   }
 }

@@ -1,244 +1,145 @@
 ---
 name: pair_trading
 description: >
-  Executes a daily pair trading decision task over a 3-month window using parquet
-  data files that contain price, news, 10-K, 10-Q, and momentum fields for a fixed
-  pool of 10 stocks. On the first trading day, selects one pair from the stock pool
-  using only information visible on that day (especially first-day news across all
-  10 stocks). Then trades that selected pair day by day for the rest of the window
-  with strict chronological processing and no future data leakage, writing one final
-  structured JSON result to results/pair_trading/.
+  Executes a daily pair-trading decision task over a fixed 3-month window by
+  querying offline market data via the `pair_trading_mcp` server. On the first
+  actual trading day, it selects one pair from the configured stock pool using
+  only information visible by that day. It then trades that fixed pair day by day
+  with strict chronological processing and no future data leakage, writing one
+  completed structured JSON result to `results/pair_trading/`.
 
   Use this skill whenever the user asks you to run a pair trading task, select a
   stock pair and trade it, execute a pair trading simulation, or produce a pair
-  trading results JSON — even if they phrase it as "run the pair trading experiment",
-  "do pair trading on the 10 stocks", "select a pair and trade it", or "process the
-  pair trading data".
+  trading results JSON - phrased as "run the pair trading experiment", "do pair
+  trading", "select a pair and trade it", or "process the pair trading data".
 ---
 
 # Pair Trading Skill
 
-You are executing a daily-frequency **pair trading** decision task over a 3-month
-window (`2025-03-01` to `2025-05-31`) using the same parquet input format as the
-single-stock trading task.
-
-Your job has two stages:
-
-1. **Pair selection stage**: on the **first trading day only**, choose **one pair of
-   stocks** from the 10-stock pool using only information from `2025-01-01` to `2025-02-28`.
-2. **Pair trading stage**: trade that selected pair day by day for the full 3-month
-   window, outputting one of the allowed pair actions per trading day.
-
-Integrity of the simulation depends entirely on you never using future information.
-Read this skill carefully before starting.
-
-For the input and output data, the user will provide a path to the input files and a
-path to the output. For example:
-
-```
-Please run the pair trading task. The input data is at /data/trading,
-please save the output json to /results/pair_trading.
-```
-
----
-
-## Setup
-
-### Identify the target ticker
-
-The fixed stock pool contains these 10 tickers:
-
-`NVDA`, `TSLA`, `AAPL`, `AMZN`, `GOOGL`, `META`, `MSFT`, `BMRN`, `CRM`, `ADBE`
-
-The data file for ticker `XYZ` lives at:
-
-```
-data/trading/XYZ-00000-of-00001.parquet
-```
-
-You must load data from `2025-01-01` to `2025-02-28` for all 10 stocks on the first trading day, because pair selection depends on comparing
-them on the first trading day.
-
-### Identify the model name
-
-The output filename encodes which model produced the results. Use the actual model
-identifier from your system context (e.g., `claude-sonnet-4-6`). Sanitize both
-`ticker` and `model` for use in filenames: replace any characters that are not
-alphanumeric, `-`, or `_` with `_`, and lowercase the model name.
-
-Example: `claude-code_trading_AAPL_claude-sonnet-4-6.json`
-
-### Ensure the output directory exists
-
-You can create the following folder to save the output:
-
-```
-results/pair_trading/
-```
-
-Create it if it doesn't exist yet.
-
----
-
-## Loading the data
-
-Use Python + pandas to read the parquet file:
-
-```python
-import pandas as pd
-
-tickers = ["NVDA", "TSLA", "MSFT", "AAPL", "AMZN", "GOOGL", "META",  "ADBE", "BMRN", "CRM"]
-
-data = {}
-for ticker in tickers:
-    df = pd.read_parquet(f"data/trading/{ticker}-00000-of-00001.parquet")
-    df = df.sort_values("date").reset_index(drop=True)
-    data[ticker] = df
-```
-
-**Schema** — each row is one calendar date for the ticker:
-
-| Field      | Type            | Notes |
-|------------|-----------------|-------|
-| `date`     | string          | e.g., `"2025-01-02"` |
-| `asset`    | string          | ticker symbol |
-| `prices`   | float64         | daily price (use as close price) |
-| `news`     | list[string] / ndarray | news headlines/summaries for that day |
-| `10k`      | list[string] / ndarray | 10-K excerpts (may be empty most days) |
-| `10q`      | list[string] / ndarray | 10-Q excerpts (may be empty most days) |
-| `momentum` | string          | directional label, e.g. `"up"`, `"down"`, `"neutral"` |
-
-**Important:** After `read_parquet`, the list fields (`news`, `10k`, `10q`) may come
-back as `numpy.ndarray` objects, not Python `list`. Do **not** check `isinstance(x,
-list)` to decide if a field is empty. Instead use:
-
-```python
-import numpy as np
-
-def is_nonempty(val):
-    if val is None:
-        return False
-    if isinstance(val, (list, np.ndarray)):
-        return len(val) > 0
-    return bool(val)
-```
-
----
-
-## Stage 1 — Pair selection on the first trading day
-
-### First trading day rule
-
-You must select the pair **once**, on the **first trading day in the target window**.
-
-The target window is:
+You are executing a daily-frequency **pair trading** task over the fixed target
+window:
 
 ```
 2025-03-01 through 2025-05-31 inclusive
 ```
 
-And the news use to select the pairs is from `2025-01-01` to `2025-02-28`, Please note that all news items are given the same weight to make the pair selection, 
-regardless of whether they appear early or late.
-Because weekends and holidays may not appear in the data, determine the actual first trading day by finding the earliest date in this window that appears in the dataset.
+You call MCP tools on the `pair_trading_mcp` server to read the configured stock
+pool, pair-selection context, pair market context, common trading dates, current
+pair prices, and deterministic pair-position mechanics. The server reads local
+offline data only. It uses the DuckDB at `PAIR_TRADING_DB_PATH`, defaulting to
+`trading/env/trading_env.duckdb`
 
-#### What information may be used for pair selection
+Do not read DuckDB files directly. Everything you know about the
+market must come from the MCP tools described below.
 
-For **pair selection only**, you may use:
+Your job has two stages:
 
-1. each stock's visible history up to and including the first trading day
-2. each stock's news on the first trading day
-3. each stock's momentum on the first trading day
-4. any `10k` / `10q` excerpts available on or before the first trading day
+1. **Pair selection stage**: on the first actual trading day in the target
+   window, choose one ordered pair from the configured stock pool using only
+   information visible up to and including that selection date.
+2. **Pair trading stage**: trade that selected pair day by day through the target
+   window, outputting one allowed pair action per processed trading day.
 
-The intended emphasis is: **select the pair based on all 10 stocks' news on the first day**, while optionally using same-day momentum and already-visible filing context as supporting information.
-
-#### What pair to select
-
-Choose exactly **two distinct stocks** from the 10-stock pool.
-
-The pair should be selected because, based on the first-day visible signals, it looks like a good candidate for a relative-value trade over the upcoming period. For example, the first-day signals may suggest:
-
-1. one stock appears relatively stronger and another relatively weaker
-2. both stocks are in comparable large-cap tech ecosystems but have diverging news sentiment
-3. one stock has positive momentum/news while another has negative or weaker signals
-4. one stock has a catalyst and the other lacks one or faces negative pressure
-
-You do **not** need to compute advanced statistical pair metrics over the full 3-month window. Do **not** use future spread behavior, future returns, or future correlation to choose the pair.
-
-#### Pair selection output behavior
-
-Once the pair is selected:
-
-1. record it in memory
-2. use the same pair for every trading day
-3. never change the pair later
-This is the heart of the task. Process days one at a time, in order. **Never read ahead.**
+Integrity of the simulation depends on never using future information.
 
 ---
 
-## Stage 2 — The trading loop for the selected pair
+## Data Access - MCP Tools
 
-This is the heart of the task. After selecting the pair on the first trading day, process trading days one at a time, in order. **Never read ahead.**
+Six tools are available on the `pair_trading_mcp` server:
 
-```
-for each trading day t in [2025-03-01 .. 2025-05-31]:
-    1. For each stock in the selected pair, slice its dataframe to rows where date <= t
-    2. Extract each stock's row for date == t; if either stock has no row on date t, skip that day
-    3. Gather signals visible for both stocks on day t
-    4. Reason over the pair relationship and decide one action
-    5. Record the decision immediately — once recorded, never change it
-    6. Move to t+1
-```
+| Tool | Purpose |
+|---|---|
+| `get_stock_pool()` | Returns the configured pool metadata: `{pool_name, symbols, backend, db_path, data_dir, file_pattern}`. The default pool is `AAPL`, `ADBE`, `AMZN`, `GOOGL`, `META`, `MSFT`, `NVDA`, `TSLA`, but `PAIR_TRADING_STOCK_POOL` may override it. |
+| `get_common_trading_dates(date_start, date_end, symbols?)` | Returns sorted dates where every requested symbol has a non-null price. Use this to find the first trading day and the dates to process for the selected pair. |
+| `get_pair_selection_context(date_start, date_end, symbols?)` | Returns rows for each requested pool symbol over `[date_start, date_end]`. Rows contain `{symbol, date, price, news, 10k, 10q, momentum}`. Use only with `date_end <= selection_date`. |
+| `get_pair_market_context(left, right, date_start, date_end)` | Returns visible rows for the fixed pair over `[date_start, date_end]`, keyed by symbol, with the same row fields. Use for daily reasoning with `date_end <= current_day`. |
+| `get_pair_prices(left, right, target_date)` | Returns `{available, date, prices}` for the selected pair on `target_date`. If either side has no price, `available=false`. |
+| `apply_pair_action(left, right, action, prices, current_position?)` | Applies deterministic old pair-trading semantics. `LONG_SHORT` opens long left / short right; `SHORT_LONG` opens short left / long right; `HOLD` keeps the existing position; `CLOSE` returns no position. |
 
-Why does order matter so much? Because this task is measuring whether you can make
-realistic trading decisions without peeking at future prices or future filings. Even
-reading tomorrow's news in a pre-scan before making today's decision would be
-cheating. Treat each day as if you are sitting at a terminal on that morning.
+### Row Shape
 
-### Which days to process
+Rows returned in selection and market context have:
 
-Only process days where both selected stocks actually appear in the dataset within
-the window. Skip weekends, holidays, and any day where one side of the pair has no
-row.
-The loop should cover the window `2025-03-01` through `2025-05-31` inclusive.
+| Field | Meaning |
+|---|---|
+| `symbol` | Ticker symbol |
+| `date` | Trading date, `YYYY-MM-DD` |
+| `price` | Canonical close/adjusted close price from the backend |
+| `volume` | Present for DuckDB-backed rows when available |
+| `news` | List of news items. DuckDB rows use objects like `{title, highlights}` |
+| `10k` | List of 10-K filing excerpts or objects visible on that date |
+| `10q` | List of 10-Q filing excerpts or objects visible on that date |
+
+The backend normalizes numpy arrays and missing values into JSON-safe lists, so
+do not write direct list handling logic in the skill execution.
 
 ---
 
-## Signals and reasoning
+## No-Look-Ahead Discipline
 
-On each trading day, you have access to:
+The local dataset may contain rows after the day you are deciding. Your tool
+calls must not request data beyond the current decision date:
 
-- **`prices`** — today's price, plus all historical prices you've seen so far
-- **`momentum`** — today's directional label
-- **`news`** — today's news items (could be empty)
-- **`10k`** / **`10q`** — any earnings/filing excerpts released on or before today
+- Pair selection: `get_pair_selection_context(..., date_end=selection_date)`.
+- Daily trading: `get_pair_market_context(..., date_end=current_day)`.
+- Do not call any tool over the full future target window before making a
+  current-day decision, except `get_common_trading_dates`, which returns only the
+  calendar of dates with prices and not market signals.
 
-### How to reason
+Never choose the pair using future returns, future spread behavior, future news,
+or future filings. Never revise earlier decisions after seeing later data.
 
-### How to reason for pair trading
+---
 
-Each daily `trajectory` should briefly explain:
+## Stage 1 - Pair Selection
 
-1. which pair was selected and why it remains the active pair
-2. what signals you saw today for both stocks
-3. which side looks stronger and which side looks weaker, or why neither side has a clear edge
-4. the action you chose and a one-sentence rationale
+1. Call `get_stock_pool()` and use its `symbols` as the stock universe.
+2. Call `get_common_trading_dates("2025-03-01", "2025-05-31", symbols=pool)` to
+   find dates where every pool member has a price. The first returned date is the
+   `selection_date`.
+3. Call `get_pair_selection_context("2025-01-01", selection_date, symbols=pool)`.
+4. Select exactly two distinct stocks from the pool and keep them in a fixed
+   order `(left, right)` for the whole run.
 
-You do not need to be exhaustive — 2 to 3 sentences is enough. The point is that the reasoning is traceable and grounded in the data actually visible on that day.
+For pair selection, emphasize information visible by `selection_date`: recent
+price history, current-day or recent news, same-day momentum if available, and
+any `10k` / `10q` excerpts dated on or before `selection_date`. A good pair is a
+relative-value candidate, for example a stronger name versus a weaker name, two
+comparable companies with diverging visible news, or one name with a positive
+catalyst against another with negative or weaker signals.
 
-#### Allowed daily actions
+Do not compute advanced statistical pair metrics using the full March-May target
+window. The pair is selected once and never changed.
 
-For each trading day, output exactly one of these actions:
+---
 
-- **`LONG_SHORT`** — go long the relatively stronger stock and short the relatively weaker stock
-- **`SHORT_LONG`** — short the first stock and go long the second stock
-- **`HOLD`** — do not initiate or change relative exposure today
+## Stage 2 - Daily Pair Trading Loop
 
-Use the `trajectory` text to make clear which stock is long and which is short.
+After selecting the pair, call:
 
-#### Action semantics
+```
+get_common_trading_dates("2025-03-01", "2025-05-31", symbols=[left, right])
+```
 
-If the pair is ordered as:
+Process the returned dates chronologically. For each `current_day`:
+
+1. Call `get_pair_market_context(left, right, date_start, current_day)`, where
+   `date_start` is an earlier visible context date such as `"2025-01-01"` or a
+   recent lookback start. The `date_end` must be `current_day`.
+2. Call `get_pair_prices(left, right, current_day)`. If `available=false`, skip
+   the day.
+3. Reason only over rows dated `<= current_day`.
+4. Choose exactly one daily action: `LONG_SHORT`, `SHORT_LONG`, or `HOLD`.
+5. Optionally call `apply_pair_action(...)` to maintain the deterministic
+   current position snapshot, especially when deciding whether `HOLD` means keep
+   an existing exposure.
+6. Append the record in memory and move to the next date. Do not change previous
+   records.
+
+### Action Semantics
+
+If the fixed pair is:
 
 ```
 ("META", "MSFT")
@@ -246,53 +147,64 @@ If the pair is ordered as:
 
 then:
 
-- **`LONG_SHORT`** means: long META, short MSFT
-- **`SHORT_LONG`** means: short META, long MSFT
-- **`HOLD`** means: maintain no new directional pair action for the day
+- `LONG_SHORT` means long META, short MSFT.
+- `SHORT_LONG` means short META, long MSFT.
+- `HOLD` means keep the existing pair position unchanged or initiate no new
+  exposure if there is no current position.
+- `CLOSE` means exit the existing pair position.
 
-To avoid ambiguity, always state the long leg and short leg explicitly in the trajectory.
-
-#### Good example
-
-```
-Pair: META, MSFT. META has positive product/news sentiment and up momentum today, while MSFT is neutral with weaker news flow. Relative signal favors META over MSFT. Decision: LONG_SHORT — long META, short MSFT.
-```
-#### Bad example (uses future info)
-
-```
-META will outperform MSFT next month, so I choose this pair and go long now.
-```
-
-#### Optional lightweight heuristics
-
-You may use simple in-loop reasoning heuristics based only on visible history, such as:
-
-- comparing today's momentum labels across the two selected stocks
-- comparing the tone or strength of today's news across the two stocks
-- checking whether either stock has a visible filing excerpt with notably positive or negative implications
-- comparing short recent visible price trend using only prior and current rows
-
-These heuristics must be computed only from data visible up to day `t`.
-
-#### Do not
-
-- fit models on the full future window
-- compute future spread reversion statistics
-- rank pairs using any information from dates after the first trading day
-- use a later date to revise the initial pair choice
+Always state the long leg and short leg explicitly in `trajectory` when the
+action opens or maintains directional exposure.
 
 ---
 
-## Output format
+## Signals and Reasoning
 
-Write a single JSON file to `results/pair_trading/{agent_name}_pair_trading_{pair}_{model}.json`, the `agent_name` is your name, e.g., "codex" or "claude-code":
+Each daily `trajectory` should briefly explain:
+
+1. which pair remains active and why it was originally selected,
+2. what visible signals you saw today for both stocks,
+3. which side looks stronger or weaker, or why there is no clear edge,
+4. the chosen action and one-sentence rationale.
+
+Two to three sentences is enough. Ground every statement in data returned by MCP.
+
+Optional lightweight heuristics are allowed when computed only from visible
+history up to `current_day`:
+
+- compare current and recent price trends for the two legs,
+- compare today's or recent news tone and catalyst strength,
+- compare momentum labels when available,
+- check visible filings for materially positive or negative implications,
+- avoid opening/changing exposure when signals conflict or are too thin.
+
+---
+
+## Output - Final JSON
+
+Write a single JSON file at the end:
+
+```
+results/pair_trading/{agent_name}_pair_trading_{pair}_{model}.json
+```
+
+where:
+
+- `agent_name` is your name, e.g. `codex` or `claude-code`,
+- `pair` is the fixed pair label, e.g. `META_MSFT`,
+- `model` is the actual model identifier from your system context.
+
+Sanitize filename parts by replacing any character that is not alphanumeric,
+`-`, or `_` with `_`; lowercase the model name.
+
+Example:
 
 ```json
 {
   "status": "completed",
   "start_date": "2025-03-03",
-  "end_date": "2025-05-28",
-  "model": "claude-sonnet-4-6",
+  "end_date": "2025-05-30",
+  "model": "gpt-5",
   "recommendations": [
     {
       "pair": "META, MSFT",
@@ -302,76 +214,53 @@ Write a single JSON file to `results/pair_trading/{agent_name}_pair_trading_{pai
         "MSFT": 401.12
       },
       "recommended_action": "LONG_SHORT",
-      "trajectory": "Pair selected on the first trading day from the 10-stock universe: META, MSFT. Today META shows stronger momentum and more positive news, while MSFT is comparatively neutral. Relative signal favors META. Decision: LONG_SHORT — long META, short MSFT."
-    },
-    {
-      "pair": "META, MSFT",
-      "date": "2025-03-04",
-      "price": {
-        "META": 180.10,
-        "MSFT": 399.88
-      },
-      "recommended_action": "HOLD",
-      "trajectory": "Pair remains META, MSFT based on the initial first-day selection. Today's momentum and news are mixed with no clear relative edge between the two names. Decision: HOLD to avoid a weak-conviction pair trade."
+      "trajectory": "Pair remains META, MSFT after the first-day selection because META had stronger visible catalysts than MSFT. Today META has firmer price action and more positive news while MSFT is comparatively neutral. Decision: LONG_SHORT - long META, short MSFT."
     }
   ]
 }
 ```
 
-**Field rules:**
+### Field Rules
 
 | Field | Rule |
-|-------|------|
-| `status` | `"completed"` if all days processed successfully; `"partial"` if stopped early |
+|---|---|
+| `status` | `"completed"` if all selected-pair trading dates were processed; `"partial"` if stopped early |
 | `start_date` | First date actually processed |
 | `end_date` | Last date actually processed |
-| `model` | The model identifier (sanitized for filename use) |
+| `model` | The model identifier |
 | `recommendations[].pair` | Pair string in fixed order, e.g. `"META, MSFT"` |
 | `recommendations[].date` | Trading date string `YYYY-MM-DD` |
-| `recommendations[].price` | Object mapping each stock in the pair to its `prices` value for that day |
-| `recommendations[].recommended_action` | Exactly one of: `LONG_SHORT"`, `"SHORT_LONG"`, `HOLD"` (uppercase) |
-| `recommendations[].trajectory` | Your reasoning for that day (2-3 sentences) |
+| `recommendations[].price` | Object mapping each leg to its current `price` |
+| `recommendations[].recommended_action` | Exactly `"LONG_SHORT"`, `"SHORT_LONG"`, or `"HOLD"` |
+| `recommendations[].trajectory` | Traceable daily reasoning, usually 2-3 sentences |
 
-
-**Write the file once, at the end**, after all decisions are made. Accumulate
-decisions in memory and write one final JSON.
+Write the file once after all decisions are made. Accumulate decisions in memory.
 
 ---
 
-## Important note on pair order
+## What NOT To Do
 
-The pair order must remain fixed throughout the file. If you selected `("META", "MSFT")` on day 1, keep writing:
-
-```json
-"pair": "META, MSFT"
-```
-on every later day.
-
----
-
-## What NOT to do
-
-- Do not pre-scan the full 3-month period before selecting the pair
-- Do not choose the pair using future returns, future spread behavior, or future news
-- Do not change the selected pair after the first trading day
-- Do not compute statistics across the whole future window before trading
-- Do not create temporary `.py` files, notebooks, debug logs, or intermediate files
-- Do not modify the result file once written
-- Do not output multiple result files for the same run
-
-If you need to compute something, do it in memory within the pair-selection step or within the chronological daily loop.
+- Do not read DuckDB directly.
+- Do not use `trading_mcp`; this skill uses `pair_trading_mcp`.
+- Do not use future market signals to select the pair or decide a daily action.
+- Do not change the selected pair after the first trading day.
+- Do not compute statistics across the full future window before trading.
+- Do not create temporary `.py` files, notebooks, debug logs, or intermediate files.
+- Do not output multiple result files for one run.
 
 ---
 
-## Implementation approach
+## Implementation Approach
 
-The cleanest approach is to write a short inline Python script via the Bash tool that:
+1. Resolve the pool with `get_stock_pool()`.
+2. Find `selection_date` with `get_common_trading_dates` over the full pool and
+   target window.
+3. Fetch selection context from `2025-01-01` through `selection_date` and choose
+   one ordered pair.
+4. Find common trading dates for the selected pair over the target window.
+5. Loop chronologically. For each date, fetch only context ending on that date,
+   fetch current pair prices, decide the action, optionally update current
+   position with `apply_pair_action`, and append one recommendation.
+6. Write one final JSON file under `results/pair_trading/`.
 
-1. loads all 10 parquet files
-2. determines the first actual trading day in the target window
-3. selects one stock pair using only first-day visible information across all 10 stocks
-4. loops over later trading days chronologically for that fixed pair
-5. collects `(pair, date, prices, action, trajectory)` records in memory
-6. writes one final JSON file at the end
-
-Keep all intermediate computation in memory. Do not save the script to disk.
+One run produces one completed pair-trading JSON file.
