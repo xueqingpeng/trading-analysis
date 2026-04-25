@@ -7,6 +7,10 @@ ANTHROPIC_API_KEY=sk-ant-...
 # ANTHROPIC_API_KEY=sk-or-v1-...
 # CLAUDE_MODEL=openai/gpt-4.1
 
+# Or Together AI (key starts with tgp_, proxy auto-detects)
+# ANTHROPIC_API_KEY=tgp_v1_...
+# CLAUDE_MODEL=meta-llama/Llama-3.3-70B-Instruct-Turbo
+
 # Or Azure Foundry (all three required)
 # ANTHROPIC_FOUNDRY_RESOURCE=your-resource
 # ANTHROPIC_FOUNDRY_API_KEY=your-key

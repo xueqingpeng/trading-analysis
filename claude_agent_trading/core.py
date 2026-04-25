@@ -40,6 +40,8 @@ def run_agent(
     permission_mode: str = "bypassPermissions",
     setting_sources: list[str] | None = None,
     mcp_servers: dict | str | Path | None = None,
+    disallowed_tools: list[str] | None = None,
+    allow_web: bool = False,
     on_assistant_text: Callable[[str], None] | None = None,
     on_thinking: Callable[[str], None] | None = None,
     on_tool_use: Callable[[str, dict], None] | None = None,
@@ -99,6 +101,13 @@ def run_agent(
     )
     if mcp_servers is not None:
         options_kwargs["mcp_servers"] = mcp_servers
+    blocked = list(disallowed_tools or [])
+    if not allow_web:
+        for t in ("WebSearch", "WebFetch"):
+            if t not in blocked:
+                blocked.append(t)
+    if blocked:
+        options_kwargs["disallowed_tools"] = blocked
     options = ClaudeAgentOptions(**options_kwargs)
     if max_thinking_tokens is not None:
         options.max_thinking_tokens = max_thinking_tokens

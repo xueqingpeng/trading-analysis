@@ -89,13 +89,24 @@ def build_daily_prompt(
 ) -> str:
     """Build the single-day trading prompt sent to the agent.
 
-    Embeds the caller-supplied `output_dir` so the agent passes
-    `--output-root` to `upsert_decision.py` and the result JSON is written
-    directly there (no intermediate copy).
+    Embeds the caller-supplied `output_dir` and `model` so the agent passes
+    `--output-root` and `--model` verbatim to `upsert_decision.py`. Pinning
+    `--model` here prevents the agent from self-identifying (often wrongly
+    on third-party providers) or inheriting a stale model name from a
+    leftover output file in `output_dir`.
     """
     return (
-        f"you are {model}. Trade {symbol} on {target_date}. "
-        f"When calling upsert_decision.py, pass --output-root={output_dir}."
+        f"Trade {symbol} on {target_date}.\n\n"
+        f"Your turn is NOT complete unless you have actually invoked the "
+        f"Bash tool to run `python3 .claude/skills/trading/scripts/"
+        f"upsert_decision.py` with all required flags. A text-only response "
+        f"that merely describes or announces the decision is a FAILURE — "
+        f"the result file will not exist on disk. Do not stop, do not write "
+        f"a summary, do not say the decision has been recorded until the "
+        f"Bash call has returned its one-line JSON success summary.\n\n"
+        f"When calling upsert_decision.py, pass --output-root={output_dir} "
+        f"and --model={model} exactly as given (do not substitute your own "
+        f"model name)."
     )
 
 
