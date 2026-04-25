@@ -71,6 +71,13 @@ def detect_provider(raw_key: str) -> ProviderInfo:
                 auth_prefix="",
             )
 
+    # OpenRouter (must be checked before generic sk- to avoid misrouting)
+    if raw_key.startswith("sk-or-"):
+        return ProviderInfo(
+            name="openrouter", api_key=raw_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
+
     # OpenAI
     if raw_key.startswith("sk-"):
         return ProviderInfo(
@@ -579,7 +586,7 @@ async def handle_messages(request: Request):
 
 # ─── Startup ──────────────────────────────────────────────────────────────────
 
-SUPPORTED_PROVIDERS = ["openai", "gemini", "azure"]
+SUPPORTED_PROVIDERS = ["openai", "openrouter", "gemini", "azure"]
 
 if __name__ == "__main__":
     print(f"Claude → OpenAI-compatible proxy")
