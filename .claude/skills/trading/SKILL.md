@@ -33,8 +33,9 @@ The user invocation specifies:
 1. **`SYMBOL`** — one of the 8 supported symbols:
    `AAPL`, `ADBE`, `AMZN`, `GOOGL`, `META`, `MSFT`, `NVDA`, `TSLA`
 2. **`TARGET_DATE`** — the trading day to decide on, `YYYY-MM-DD`. **Optional.**
-   If omitted, call `is_trading_day(SYMBOL, <your best guess>)` and use the
-   returned `latest_date_in_db`.
+   If omitted, call `is_trading_day(SYMBOL, today_or_any_recent_date)` — the
+   `latest_date_in_db` field in the response is the real cutoff to use as
+   `TARGET_DATE`.
 
 Typical user phrasings:
 - `trade AAPL on 2025-03-05`
@@ -45,19 +46,18 @@ Typical user phrasings:
 
 ## Data access — DuckDB via MCP
 
-Tools on the `trading_mcp` server. **Prefer the list/get pair + `is_trading_day`
-(marked `[preferred]`) — they keep individual tool results small and let the
-agent fetch detail on demand. Bulk returns of full news highlights or filing
-bodies can exceed the model's context limit.**
+Tools on the `trading_mcp` server. The list/get pair pattern keeps individual
+tool results small and lets the agent fetch detail on demand — bulk fetches
+of full news highlights or filing bodies can exceed the model's context limit.
 
 | Tool | Purpose |
 |---|---|
 | `get_prices(symbol, date_start, date_end)` | Rows `{symbol, date, open, high, low, close, adj_close, volume}` in the range. `adj_close` is the canonical trading price. |
-| `[preferred]` `is_trading_day(symbol, target_date)` | Returns `{is_trading_day, reason, prev_trading_day, prev_trading_day_adj_close, latest_date_in_db, should_upsert}`. `reason ∈ {'trading_day','weekend','holiday','not_loaded'}`. Use this **first** every day — it replaces weekday checks and missing-row checks, and exposes the latest loaded date. |
-| `[preferred]` `list_news(symbol, date_start, date_end)` | Compact news metadata: `{symbol, date, id, title, url}` — no `highlights`. Use this first to scan headlines. |
-| `[preferred]` `get_news_by_id(symbol, id)` | Full article for one id: `{symbol, date, id, title, url, highlights}`. Call after `list_news` for the relevant ones. |
-| `[preferred]` `list_filings(symbol, date_start, date_end, document_type?)` | Compact filings metadata: `{symbol, date, document_type, mda_chars, risk_chars}` — no content. Use to decide if/which section is worth reading. |
-| `[preferred]` `get_filing_section(symbol, date, document_type, section, offset=0, limit=None)` | Fetch one section (`'mda'` or `'risk'`) of a specific filing. Omit `limit` for the whole section; use `offset/limit` to paginate long sections. Returns `{content, total_chars, offset, returned_chars, has_more, …}`. |
+| `is_trading_day(symbol, target_date)` | Returns `{is_trading_day, reason, prev_trading_day, prev_trading_day_adj_close, latest_date_in_db, should_upsert}`. `reason ∈ {'trading_day','weekend','holiday','not_loaded'}`. Use this **first** every day — it replaces weekday checks and missing-row checks, and exposes the latest loaded date. |
+| `list_news(symbol, date_start, date_end, preview_chars?=300)` | Compact news metadata: `{symbol, date, id, highlights_chars, highlights_preview}` — preview is the first `preview_chars` chars of the body (no full highlights). Use this first to scan the lead of each day's coverage. |
+| `get_news_by_id(symbol, id)` | Full article for one id: `{symbol, date, id, highlights}`. Call after `list_news` for the days whose preview looks relevant. |
+| `list_filings(symbol, date_start, date_end, document_type?)` | Compact filings metadata: `{symbol, date, document_type, mda_chars, risk_chars}` — no content. Use to decide if/which section is worth reading. |
+| `get_filing_section(symbol, date, document_type, section, offset=0, limit=None)` | Fetch one section (`'mda'` or `'risk'`) of a specific filing. Omit `limit` for the whole section; use `offset/limit` to paginate long sections. Returns `{content, total_chars, offset, returned_chars, has_more, …}`. |
 | `get_indicator(symbol, date_start, date_end, indicator, length?)` | Computes a technical indicator. `indicator` ∈ {`ma`, `rsi`, `bbands`, `macd`}. Optional — use only if indicators help your decision. |
 
 ### Writing the result — `upsert_decision.py` (CLI, not MCP)
@@ -101,24 +101,29 @@ This keeps the decision valid under any data population policy.
      and report to the user; do not run the upsert script.**
    - `reason == "trading_day"`: continue.
 
-2. `get_prices(SYMBOL, TARGET_DATE - 30d, TARGET_DATE)` — recent ~1 month of
-   OHLCV. `price_today` is the `adj_close` of the row where
-   `date == TARGET_DATE`. Use the rest for trend / volatility.
+2. `get_prices(SYMBOL, date_start, TARGET_DATE)` — pick the window that fits
+   your read (e.g. last 5 / 30 / 60 trading days). `price_today` is the
+   `adj_close` of the row where `date == TARGET_DATE`; use the rest for trend
+   and volatility context.
 
-3. `list_news(SYMBOL, TARGET_DATE - 7d, TARGET_DATE)` — scan titles. Then,
-   for each article whose title looks relevant, call
-   `get_news_by_id(SYMBOL, id)` for the full `highlights`. Don't pull
-   articles whose titles are clearly irrelevant.
+3. `list_news(SYMBOL, date_start, TARGET_DATE)` — pick a window that fits
+   your need (e.g. the last 1, 3, or 7 days; one row per day). Scan each
+   day's `highlights_preview` and call `get_news_by_id(SYMBOL, id)` for the
+   days worth reading in full. Bump `preview_chars` if 300 isn't enough to
+   judge.
 
 4. (Optional) If news or price action suggests a fundamentals check:
-   `list_filings(SYMBOL, TARGET_DATE - 1y, TARGET_DATE)` — look at
-   `mda_chars` / `risk_chars` to decide whether the section is worth reading,
-   then `get_filing_section(..., section='mda' | 'risk')`. For very long
-   sections, paginate with `offset`/`limit` and stop when you have enough.
+   `list_filings(SYMBOL, date_start, TARGET_DATE)` with a window you choose
+   (typically last 6 months or 1 year — older filings are stale and 1 year
+   already covers a 10-K plus three 10-Qs). Look at `mda_chars` /
+   `risk_chars` to decide whether the section is worth reading, then
+   `get_filing_section(..., section='mda' | 'risk')`. For very long sections,
+   paginate with `offset`/`limit` and stop when you have enough.
 
-   (Optional) `get_indicator(SYMBOL, TARGET_DATE - 60d, TARGET_DATE,
-   'rsi' | 'macd' | 'ma' | 'bbands')` if a technical signal would confirm /
-   contradict your read.
+   (Optional) `get_indicator(SYMBOL, date_start, TARGET_DATE, 'rsi' | 'macd'
+   | 'ma' | 'bbands')` with a window you choose (e.g. last 30 / 60 / 120
+   trading days; longer windows give MACD/EMA more time to converge) if a
+   technical signal would confirm / contradict your read.
 
 5. **Run `.claude/skills/trading/scripts/upsert_decision.py` via Bash** to
    record the decision. The script owns load-or-create / sort /
@@ -128,7 +133,8 @@ This keeps the decision valid under any data population policy.
    python3 .claude/skills/trading/scripts/upsert_decision.py \
        --symbol SYMBOL --target-date TARGET_DATE \
        --price PRICE_TODAY --action <BUY|SELL|HOLD> \
-       --model <your model id>
+       --model <your model id> \
+       --output-root <whatever the caller specified, e.g. /io/slot1>
    ```
 
    On success it prints one JSON line with `{path, action_recorded,
@@ -194,7 +200,8 @@ python3 .claude/skills/trading/scripts/upsert_decision.py \
     --target-date 2025-03-03 \
     --price 284.65 \
     --action BUY \
-    --model claude-sonnet-4-6
+    --model claude-sonnet-4-6 \
+    --output-root /io/slot1   # whatever the caller specified
 ```
 
 | Flag | Value |
@@ -204,7 +211,7 @@ python3 .claude/skills/trading/scripts/upsert_decision.py \
 | `--price` | `adj_close` from the `get_prices` row for `TARGET_DATE`, or `prev_trading_day_adj_close` on a forced HOLD |
 | `--action` | Exactly `BUY`, `SELL`, or `HOLD` |
 | `--model` | Your actual model identifier — the only run-differentiator in the filename |
-| `--output-root` | Optional. Default `results/trading` (relative to cwd). |
+| `--output-root` | **Pass the value the caller specified in the invocation** (e.g. `/io/slot1`). Falls back to `results/trading` (relative to cwd) only if no value was given — that default is rarely writable inside a sandbox, so omitting it usually causes a `PermissionError`. |
 
 ### What it writes
 
@@ -249,25 +256,29 @@ date's record (lets the caller re-run one day).
 
 ## Implementation approach
 
-1. Resolve `TARGET_DATE`: if the user provided one, use it. Otherwise read
-   `is_trading_day(SYMBOL, <your best guess>).latest_date_in_db` — or just
-   call `is_trading_day` and use whatever date the user wants.
+1. Resolve `TARGET_DATE`: if the user provided one, use it. Otherwise call
+   `is_trading_day(SYMBOL, today_or_any_recent_date)` and use the
+   `latest_date_in_db` field from the response as `TARGET_DATE`.
 2. **`is_trading_day(SYMBOL, TARGET_DATE)`** — branch on `reason`:
    - `"weekend"` or `"holiday"`: set `action = "HOLD"`,
      `price_today = prev_trading_day_adj_close`, skip to step 6.
    - `"not_loaded"`: **stop and report to the user**, do not run the upsert
      script.
    - `"trading_day"`: continue.
-3. `get_prices(SYMBOL, TARGET_DATE - 30d, TARGET_DATE)` for trend. Extract
-   `price_today` = `adj_close` of the row where `date == TARGET_DATE`.
-4. `list_news(SYMBOL, TARGET_DATE - 7d, TARGET_DATE)` → scan titles → for each
-   relevant id, `get_news_by_id(SYMBOL, id)` for full highlights.
-5. (Optional) If fundamentals matter, `list_filings(SYMBOL, TARGET_DATE - 1y,
-   TARGET_DATE)` → `get_filing_section(..., section='mda' | 'risk')` for the
-   section(s) worth reading. Paginate with `offset`/`limit` if the section is
-   long and you want to stop partway through.
-   (Optional) `get_indicator(SYMBOL, TARGET_DATE - 60d, TARGET_DATE, 'rsi' |
-   'macd' | 'ma' | 'bbands')` if a technical signal helps.
+3. `get_prices(SYMBOL, date_start, TARGET_DATE)` with a window you choose
+   (e.g. last 5 / 30 / 60 trading days). Extract `price_today` = `adj_close`
+   of the row where `date == TARGET_DATE`.
+4. `list_news(SYMBOL, date_start, TARGET_DATE)` with a window you choose
+   (last 1 / 3 / 7 days, one row per day) → scan `highlights_preview` →
+   `get_news_by_id(SYMBOL, id)` for the days worth reading in full.
+5. (Optional) If fundamentals matter, `list_filings(SYMBOL, date_start,
+   TARGET_DATE)` with a window you choose (typically 6 months or 1 year) →
+   `get_filing_section(..., section='mda' | 'risk')` for the section(s) worth
+   reading. Paginate with `offset`/`limit` if the section is long and you
+   want to stop partway through.
+   (Optional) `get_indicator(SYMBOL, date_start, TARGET_DATE, 'rsi' | 'macd'
+   | 'ma' | 'bbands')` with a window you choose (e.g. 30 / 60 / 120 trading
+   days) if a technical signal helps.
 6. Decide `action` based on the data you actually fetched.
 7. Run `python3 .claude/skills/trading/scripts/upsert_decision.py` via the
    Bash tool with the 5 required flags. Don't write inline Python.

@@ -10,9 +10,7 @@ CREATE TABLE IF NOT EXISTS filings (
 CREATE TABLE IF NOT EXISTS news (
     id         INTEGER PRIMARY KEY,
     symbol     VARCHAR NOT NULL,
-    date       TIMESTAMP NOT NULL,
-    title      TEXT,
-    url        TEXT,
+    date       DATE NOT NULL,
     highlights TEXT
 );
 
