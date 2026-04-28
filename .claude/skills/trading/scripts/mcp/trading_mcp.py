@@ -56,70 +56,6 @@ def _connect() -> duckdb.DuckDBPyConnection:
 
 @mcp.tool(
     description=(
-        "Return SEC filings (10-K, 10-Q) for a symbol in [date_start, date_end] inclusive. "
-        "To respect no-look-ahead, pass date_end <= your current target trading day. "
-        "For a typical past-year window at a given target date T, use date_start = T - 1 year, date_end = T. "
-        "Returns rows of {symbol, date, document_type, mda_content, risk_content}."
-    )
-)
-def get_filings(
-    symbol: Annotated[str, Field(description="Stock symbol, e.g. 'AAPL'")],
-    date_start: Annotated[str, Field(description="Inclusive start date YYYY-MM-DD")],
-    date_end: Annotated[str, Field(description="Inclusive end date YYYY-MM-DD")],
-    document_type: Annotated[
-        Optional[str],
-        Field(description="'10-K' or '10-Q'; omit for both"),
-    ] = None,
-) -> list[dict]:
-    sql = (
-        "SELECT symbol, CAST(date AS VARCHAR) AS date, "
-        "document_type, mda_content, risk_content "
-        "FROM filings "
-        "WHERE symbol = ? AND date >= ? AND date <= ?"
-    )
-    params: list = [symbol, date_start, date_end]
-    if document_type is not None:
-        sql += " AND document_type = ?"
-        params.append(document_type)
-    sql += " ORDER BY date DESC"
-
-    with _connect() as conn:
-        rows = conn.execute(sql, params).fetchall()
-    return [
-        {"symbol": r[0], "date": r[1], "document_type": r[2], "mda_content": r[3], "risk_content": r[4]}
-        for r in rows
-    ]
-
-
-@mcp.tool(
-    description=(
-        "Return news items for a symbol in [date_start, date_end] inclusive. "
-        "To respect no-look-ahead, pass date_end <= your current target trading day. "
-        "Returns rows of {symbol, date, id, title, highlights}."
-    )
-)
-def get_news(
-    symbol: Annotated[str, Field(description="Stock symbol, e.g. 'AAPL'")],
-    date_start: Annotated[str, Field(description="Inclusive start date YYYY-MM-DD")],
-    date_end: Annotated[str, Field(description="Inclusive end date YYYY-MM-DD")],
-) -> list[dict]:
-    sql = (
-        "SELECT symbol, CAST(DATE(date) AS VARCHAR) AS date, "
-        "id, title, highlights "
-        "FROM news "
-        "WHERE symbol = ? AND DATE(date) >= ? AND DATE(date) <= ? "
-        "ORDER BY date ASC, id ASC"
-    )
-    with _connect() as conn:
-        rows = conn.execute(sql, [symbol, date_start, date_end]).fetchall()
-    return [
-        {"symbol": r[0], "date": r[1], "id": r[2], "title": r[3], "highlights": r[4]}
-        for r in rows
-    ]
-
-
-@mcp.tool(
-    description=(
         "Return daily OHLCV prices for a symbol in [date_start, date_end] inclusive. "
         "To respect no-look-ahead, pass date_end <= your current target trading day. "
         "Also useful to discover the list of trading days that have data. "
@@ -149,22 +85,6 @@ def get_prices(
         }
         for r in rows
     ]
-
-
-@mcp.tool(
-    description=(
-        "Return the latest available trading date in the prices table for a symbol. "
-        "Use this when no explicit target_date was supplied to the trading skill."
-    )
-)
-def get_latest_date(
-    symbol: Annotated[str, Field(description="Stock symbol, e.g. 'AAPL'")],
-) -> Optional[str]:
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT CAST(MAX(date) AS VARCHAR) FROM prices WHERE symbol = ?", [symbol]
-        ).fetchone()
-    return row[0] if row and row[0] else None
 
 
 _INDICATOR_DEFAULT_LENGTH = {
@@ -287,11 +207,14 @@ def get_indicator(
 @mcp.tool(
     description=(
         "Return compact news metadata for a symbol in [date_start, date_end] "
-        "inclusive: one row per article with {symbol, date, id, title, url} — "
-        "the `highlights` body is NOT included. Use this FIRST to scan "
-        "headlines, then call `get_news_by_id` for the specific articles "
-        "you want to read in full. Much cheaper than `get_news` which pulls "
-        "every article's full highlights in one call.\n\n"
+        "inclusive: one row per article with "
+        "{symbol, date, id, highlights_chars, highlights_preview} — "
+        "`highlights_preview` is the first `preview_chars` characters of the "
+        "highlights body (default 300), `highlights_chars` is the total length. "
+        "Use this FIRST to scan the lead of each day's coverage, then call "
+        "`get_news_by_id` to pull the full text of the days that look "
+        "relevant. Much cheaper than `get_news` which pulls every article's "
+        "full highlights in one call.\n\n"
         "To respect no-look-ahead, pass date_end <= your current target "
         "trading day."
     )
@@ -300,17 +223,33 @@ def list_news(
     symbol: Annotated[str, Field(description="Stock symbol, e.g. 'AAPL'")],
     date_start: Annotated[str, Field(description="Inclusive start date YYYY-MM-DD")],
     date_end: Annotated[str, Field(description="Inclusive end date YYYY-MM-DD")],
+    preview_chars: Annotated[
+        int,
+        Field(
+            description="Number of leading characters of `highlights` to return as preview (default 300, max 2000).",
+            ge=0,
+            le=2000,
+        ),
+    ] = 300,
 ) -> list[dict]:
     sql = (
-        "SELECT symbol, CAST(DATE(date) AS VARCHAR) AS date, id, title, url "
+        "SELECT symbol, CAST(date AS VARCHAR) AS date, id, "
+        "LENGTH(highlights) AS highlights_chars, "
+        "SUBSTRING(highlights, 1, ?) AS preview "
         "FROM news "
-        "WHERE symbol = ? AND DATE(date) >= ? AND DATE(date) <= ? "
+        "WHERE symbol = ? AND date >= ? AND date <= ? "
         "ORDER BY date ASC, id ASC"
     )
     with _connect() as conn:
-        rows = conn.execute(sql, [symbol, date_start, date_end]).fetchall()
+        rows = conn.execute(
+            sql, [int(preview_chars), symbol, date_start, date_end]
+        ).fetchall()
     return [
-        {"symbol": r[0], "date": r[1], "id": r[2], "title": r[3], "url": r[4]}
+        {
+            "symbol": r[0], "date": r[1], "id": r[2],
+            "highlights_chars": int(r[3] or 0),
+            "highlights_preview": r[4] or "",
+        }
         for r in rows
     ]
 
@@ -318,9 +257,9 @@ def list_news(
 @mcp.tool(
     description=(
         "Fetch a single news article in full by its id. Returns "
-        "{symbol, date, id, title, url, highlights} or null if not found. "
+        "{symbol, date, id, highlights} or null if not found. "
         "Call this AFTER `list_news` to pull the full highlights text of "
-        "articles whose titles you judged relevant."
+        "the days whose preview you judged relevant."
     )
 )
 def get_news_by_id(
@@ -328,7 +267,7 @@ def get_news_by_id(
     id: Annotated[int, Field(description="News row id returned by list_news")],
 ) -> Optional[dict]:
     sql = (
-        "SELECT symbol, CAST(DATE(date) AS VARCHAR) AS date, id, title, url, highlights "
+        "SELECT symbol, CAST(date AS VARCHAR) AS date, id, highlights "
         "FROM news WHERE symbol = ? AND id = ?"
     )
     with _connect() as conn:
@@ -337,7 +276,7 @@ def get_news_by_id(
         return None
     return {
         "symbol": row[0], "date": row[1], "id": row[2],
-        "title": row[3], "url": row[4], "highlights": row[5],
+        "highlights": row[3],
     }
 
 

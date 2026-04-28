@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hedging_mcp": {
+      "command": "python3",
+      "args": [".claude/skills/hedging/scripts/mcp/hedging_mcp.py"]
+    }
+  }
+}

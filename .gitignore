@@ -41,6 +41,7 @@ runs/
 
 # Data
 
+.duckdb
 financial_agentic_benchmark/
 .codex/
 context_as_world/

@@ -65,13 +65,17 @@ class IterTradingDaysTests(unittest.TestCase):
 
 class BuildDailyPromptTests(unittest.TestCase):
     def test_format(self) -> None:
-        self.assertEqual(
-            build_daily_prompt(
-                "claude-sonnet-4-6", "TSLA", "2025-03-05", Path("/tmp/out")
-            ),
-            "you are claude-sonnet-4-6. Trade TSLA on 2025-03-05. "
-            "When calling upsert_decision.py, pass --output-root=/tmp/out.",
+        prompt = build_daily_prompt(
+            "claude-sonnet-4-6", "TSLA", "2025-03-05", Path("/tmp/out")
         )
+        # Key facts the prompt must carry to the agent.
+        self.assertIn("TSLA", prompt)
+        self.assertIn("2025-03-05", prompt)
+        self.assertIn("--output-root=/tmp/out", prompt)
+        self.assertIn("--model=claude-sonnet-4-6", prompt)
+        # Forces an actual upsert_decision.py Bash call (not text-only).
+        self.assertIn("upsert_decision.py", prompt)
+        self.assertIn("Bash", prompt)
 
 
 class RunTradingRangeTests(unittest.TestCase):
@@ -101,11 +105,12 @@ class RunTradingRangeTests(unittest.TestCase):
                 run_trading_range(config)
 
             run_agent.assert_called_once()
-            self.assertEqual(
-                run_agent.call_args.kwargs["prompt"],
-                "you are test-model. Trade TSLA on 2025-03-03. "
-                f"When calling upsert_decision.py, pass --output-root={out.resolve()}.",
-            )
+            prompt = run_agent.call_args.kwargs["prompt"]
+            self.assertIn("TSLA", prompt)
+            self.assertIn("2025-03-03", prompt)
+            self.assertIn(f"--output-root={out.resolve()}", prompt)
+            self.assertIn("--model=test-model", prompt)
+            self.assertIn("upsert_decision.py", prompt)
             self.assertEqual(run_agent.call_args.kwargs["model"], "test-model")
 
 

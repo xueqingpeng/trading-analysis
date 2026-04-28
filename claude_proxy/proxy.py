@@ -4,17 +4,20 @@ Claude API → OpenAI-compatible API Proxy
 Receives Claude /v1/messages requests, translates them to OpenAI /v1/chat/completions format,
 and translates the streaming response back to Claude SSE format.
 
-Supports OpenAI / Gemini / Azure OpenAI — auto-detects provider based on API key prefix.
-Proxy is a pure forwarder: model selection and API key are provided by the client.
+Supports OpenAI / OpenRouter / Together / Gemini / Azure — auto-detects
+provider based on API key prefix. Proxy is a pure forwarder: model selection
+and API key are provided by the client.
 
 Usage:
     python proxy.py
 
     # Client sets ANTHROPIC_API_KEY depending on provider:
-    #   OpenAI:  sk-...
-    #   Gemini:  AIzaSy...
-    #   Azure:   azure:<endpoint>:<api-key>
-    #            e.g. azure:https://myres.openai.azure.com:abcdef123456
+    #   OpenAI:      sk-...
+    #   OpenRouter:  sk-or-...
+    #   Together:    tgp_...
+    #   Gemini:      AIzaSy...
+    #   Azure:       azure:<endpoint>:<api-key>
+    #                e.g. azure:https://myres.openai.azure.com:abcdef123456
 """
 
 import json
@@ -70,6 +73,20 @@ def detect_provider(raw_key: str) -> ProviderInfo:
                 auth_header="api-key",
                 auth_prefix="",
             )
+
+    # Together AI (keys start with `tgp_`)
+    if raw_key.startswith("tgp_"):
+        return ProviderInfo(
+            name="together", api_key=raw_key,
+            base_url="https://api.together.xyz/v1",
+        )
+
+    # OpenRouter (must be checked before generic sk- to avoid misrouting)
+    if raw_key.startswith("sk-or-"):
+        return ProviderInfo(
+            name="openrouter", api_key=raw_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
 
     # OpenAI
     if raw_key.startswith("sk-"):
@@ -362,6 +379,8 @@ class ToolState:
 class StreamState:
     text_started: bool = False
     text_idx: int = -1
+    thinking_started: bool = False
+    thinking_idx: int = -1
     cur_idx: int = 0
     tools: dict = field(default_factory=dict)
     usage: dict = field(default_factory=dict)
@@ -373,9 +392,19 @@ def format_sse(event_type, data):
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
 
 
-async def translate_stream(response_lines, model_name):
-    """Translate OpenAI SSE stream → Claude SSE stream."""
+async def translate_stream(response_lines, model_name, allowed_tools=None):
+    """Translate OpenAI SSE stream → Claude SSE stream.
+
+    `allowed_tools` is the set of tool names the client declared in the
+    request. Some providers (OpenRouter + MiniMax, etc.) inject their own
+    built-in tools (`fetch_fetch`, `fetch_search_results`, ...) that the
+    Claude SDK never registered. If forwarded, the SDK has no handler and
+    the agent hangs waiting for a tool_result. We silently drop any
+    tool_call whose name isn't in `allowed_tools`.
+    """
     state = StreamState()
+    dropped_tool_indices: set[int] = set()
+    dropped_tool_names: list[str] = []
     msg_id = f"msg_{uuid.uuid4().hex[:16]}"
 
     yield format_sse("message_start", {
@@ -418,9 +447,48 @@ async def translate_stream(response_lines, model_name):
         delta = choice.get("delta", {})
         finish_reason = choice.get("finish_reason")
 
+        # Reasoning content (OpenAI-style `delta.reasoning` from reasoning
+        # models like minimax-m2, deepseek-r1). Forward as a Claude thinking
+        # block so it's visible to on_thinking callbacks. Without this, the
+        # whole chain-of-thought is silently dropped and the model often
+        # appears to "do nothing" in logs.
+        reasoning_content = delta.get("reasoning")
+        if reasoning_content:
+            if not state.thinking_started:
+                state.thinking_idx = state.cur_idx
+                state.cur_idx += 1
+                yield format_sse("content_block_start", {
+                    "type": "content_block_start",
+                    "index": state.thinking_idx,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                })
+                state.thinking_started = True
+
+            yield format_sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": state.thinking_idx,
+                "delta": {"type": "thinking_delta", "thinking": reasoning_content},
+            })
+
         # Text content
         text_content = delta.get("content")
         if text_content:
+            # Close thinking block before starting text (Claude order: thinking → text)
+            if state.thinking_started:
+                # Emit signature_delta — Anthropic's real API always sends one
+                # before closing a thinking block. Some SDK versions reject
+                # the response as malformed if it's missing.
+                yield format_sse("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": state.thinking_idx,
+                    "delta": {"type": "signature_delta", "signature": ""},
+                })
+                yield format_sse("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": state.thinking_idx,
+                })
+                state.thinking_started = False
+
             if not state.text_started:
                 state.text_idx = state.cur_idx
                 state.cur_idx += 1
@@ -446,14 +514,39 @@ async def translate_stream(response_lines, model_name):
                 tool_name = func.get("name")
                 tool_args = func.get("arguments", "")
 
+                # Drop server-injected tools the client didn't declare.
+                if tool_name and allowed_tools is not None and tool_name not in allowed_tools:
+                    dropped_tool_indices.add(idx)
+                    dropped_tool_names.append(tool_name)
+                    print(
+                        f"[proxy] dropping unsolicited tool_call: {tool_name}"
+                        f" (allowed={sorted(allowed_tools)[:6]}...)",
+                        flush=True,
+                    )
+                    continue
+                if idx in dropped_tool_indices:
+                    continue
+
                 if tool_name:
-                    # Close text block before starting a tool
+                    print(f"[proxy] tool_call: {tool_name}", flush=True)
+                    # Close any open text/thinking block before starting a tool
                     if state.text_started:
                         yield format_sse("content_block_stop", {
                             "type": "content_block_stop",
                             "index": state.text_idx,
                         })
                         state.text_started = False
+                    if state.thinking_started:
+                        yield format_sse("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": state.thinking_idx,
+                            "delta": {"type": "signature_delta", "signature": ""},
+                        })
+                        yield format_sse("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": state.thinking_idx,
+                        })
+                        state.thinking_started = False
 
                     tool_id = tc.get("id", f"tool_{uuid.uuid4().hex[:12]}")
                     block_idx = state.cur_idx
@@ -490,11 +583,82 @@ async def translate_stream(response_lines, model_name):
             else:
                 state.stop_reason = "end_turn"
 
-    # Close all open blocks
+    # If we dropped tool_calls and emitted no text/tool, the assistant
+    # message would be empty (or only contain a thinking block). Claude CLI
+    # rejects that with "model's tool call could not be parsed". Inject a
+    # text block so the SDK has something concrete and the model sees its
+    # own attempt on the next turn — usually enough to make it switch to
+    # the listed tools.
+    # Close any open blocks before potentially injecting a synthetic one.
+    if state.thinking_started:
+        yield format_sse("content_block_delta", {
+            "type": "content_block_delta",
+            "index": state.thinking_idx,
+            "delta": {"type": "signature_delta", "signature": ""},
+        })
+        yield format_sse("content_block_stop", {
+            "type": "content_block_stop",
+            "index": state.thinking_idx,
+        })
+        state.thinking_started = False
     if state.text_started:
         yield format_sse("content_block_stop", {
             "type": "content_block_stop",
             "index": state.text_idx,
+        })
+        state.text_started = False
+
+    # If the entire stream produced no actionable content block, the SDK
+    # reports "API returned an empty or malformed response (HTTP 200)".
+    # Inject a placeholder text so the message has at least one content
+    # block. Either:
+    #   (a) we dropped unsolicited tools and there's no fallback content, or
+    #   (b) the upstream returned literally nothing (no reasoning/text/tools).
+    forwarded_tools = [t for t in state.tools.values() if t.started]
+    nothing_emitted = (
+        state.thinking_idx < 0  # no thinking block opened
+        and state.text_idx < 0  # no text block opened
+        and not forwarded_tools  # no tool calls forwarded
+    )
+    if nothing_emitted:
+        synth_idx = state.cur_idx
+        state.cur_idx += 1
+        yield format_sse("content_block_start", {
+            "type": "content_block_start",
+            "index": synth_idx,
+            "content_block": {"type": "text", "text": ""},
+        })
+        yield format_sse("content_block_delta", {
+            "type": "content_block_delta",
+            "index": synth_idx,
+            "delta": {"type": "text_delta", "text": "[empty response from upstream]"},
+        })
+        yield format_sse("content_block_stop", {
+            "type": "content_block_stop",
+            "index": synth_idx,
+        })
+    elif dropped_tool_names and not forwarded_tools:
+        synth_idx = state.cur_idx
+        state.cur_idx += 1
+        names = ", ".join(dropped_tool_names)
+        msg = (
+            f"[Tried to call unavailable tool(s): {names}. These are not "
+            f"part of this environment. Use only the tools listed in the "
+            f"system prompt and the project skill.]"
+        )
+        yield format_sse("content_block_start", {
+            "type": "content_block_start",
+            "index": synth_idx,
+            "content_block": {"type": "text", "text": ""},
+        })
+        yield format_sse("content_block_delta", {
+            "type": "content_block_delta",
+            "index": synth_idx,
+            "delta": {"type": "text_delta", "text": msg},
+        })
+        yield format_sse("content_block_stop", {
+            "type": "content_block_stop",
+            "index": synth_idx,
         })
 
     for t in state.tools.values():
@@ -539,6 +703,11 @@ async def handle_messages(request: Request):
 
     openai_payload = translate_request(body, model)
     url = provider.chat_completions_url(model)
+    allowed_tools = {
+        t["function"]["name"]
+        for t in openai_payload.get("tools", [])
+        if isinstance(t, dict) and t.get("function", {}).get("name")
+    }
 
     print(f"[proxy] {provider.name} | model={model} | "
           f"msgs={len(openai_payload['messages'])} | "
@@ -567,7 +736,9 @@ async def handle_messages(request: Request):
                     })
                     return
 
-                async for chunk in translate_stream(resp.aiter_lines(), model):
+                async for chunk in translate_stream(
+                    resp.aiter_lines(), model, allowed_tools=allowed_tools
+                ):
                     yield chunk
 
     return StreamingResponse(
@@ -579,7 +750,7 @@ async def handle_messages(request: Request):
 
 # ─── Startup ──────────────────────────────────────────────────────────────────
 
-SUPPORTED_PROVIDERS = ["openai", "gemini", "azure"]
+SUPPORTED_PROVIDERS = ["openai", "openrouter", "together", "gemini", "azure"]
 
 if __name__ == "__main__":
     print(f"Claude → OpenAI-compatible proxy")
