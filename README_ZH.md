@@ -227,7 +227,7 @@ print(f"Cost: ${result.agent_result.cost_usd:.4f}")
 trading-analysis/
 ├── .claude/skills/             # Agent SDK 自动发现的 skill 定义
 │   ├── trading/                # SKILL.md + scripts/（MCP server、upsert_decision.py…）
-│   ├── pair_trading/
+│   ├── hedging/
 │   ├── report_generation/
 │   ├── report_evaluation/
 │   └── auditing/

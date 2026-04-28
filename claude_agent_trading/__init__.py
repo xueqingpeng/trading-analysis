@@ -15,6 +15,11 @@ from .trading_daily import (
     TradingRangeResult,
     run_trading_range,
 )
+from .hedging_daily import (
+    HedgingDailyConfig,
+    HedgingRangeResult,
+    run_hedging_range,
+)
 
 __all__ = [
     "run_agent",
@@ -29,4 +34,7 @@ __all__ = [
     "DailyResult",
     "TradingRangeResult",
     "run_trading_range",
+    "HedgingDailyConfig",
+    "HedgingRangeResult",
+    "run_hedging_range",
 ]
