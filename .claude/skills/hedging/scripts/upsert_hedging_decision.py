@@ -53,7 +53,7 @@ def main() -> None:
     parser.add_argument(
         "--action",
         required=True,
-        choices=["LONG_SHORT", "SHORT_LONG", "HOLD"],
+        choices=["LONG_SHORT", "SHORT_LONG", "HOLD", "CLOSE"],
         help="Pair-trading recommendation",
     )
     parser.add_argument("--model", required=True, help="Model identifier")

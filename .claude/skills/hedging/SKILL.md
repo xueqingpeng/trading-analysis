@@ -88,7 +88,7 @@ of full news highlights or filing bodies can exceed the model context.
 | `get_news_by_id(symbol, id)` | Full article for one id: `{symbol, date, id, highlights}`. Call after `list_news` for the days whose preview looks relevant. |
 | `list_filings(symbol, date_start, date_end, document_type?)` | Compact filings metadata: `{symbol, date, document_type, mda_chars, risk_chars}` — no content. Use to decide if/which section is worth reading. |
 | `get_filing_section(symbol, date, document_type, section, offset=0, limit=None)` | Fetch one section (`'mda'` or `'risk'`) of a specific filing. Omit `limit` for the whole section; use `offset/limit` to paginate long sections. Returns `{content, total_chars, offset, returned_chars, has_more, …}`. |
-| `apply_pair_action(left, right, action, prices, current_position?)` | Optional helper for deterministic dollar-neutral pair-position math (`LONG_SHORT`, `SHORT_LONG`, `HOLD`, `CLOSE`). Returns the new position dict (or null on `CLOSE`). The position is **not persisted** in the output — this tool is only for the agent's in-turn reasoning. |
+| `apply_pair_action(left, right, action, prices, current_position?)` | Optional helper for deterministic dollar-neutral pair-position math (`LONG_SHORT`, `SHORT_LONG`, `HOLD`, `CLOSE`). Returns the new position dict (or null on `CLOSE`). The output persists the daily lifecycle action, but not the derived share snapshot. |
 
 ### Helper Scripts
 
@@ -182,9 +182,10 @@ For a fixed pair and `TARGET_DATE`:
    a 10-K plus three 10-Qs; older filings are stale) and then
    `get_filing_section` if fundamentals would materially affect the pair
    decision.
-5. Choose exactly one daily action: `LONG_SHORT`, `SHORT_LONG`, or `HOLD`.
+5. Choose exactly one daily action: `LONG_SHORT`, `SHORT_LONG`, `HOLD`, or
+   `CLOSE`.
 6. Optionally call `apply_pair_action` to maintain the deterministic position
-   snapshot when deciding whether `HOLD` means keep existing exposure.
+   snapshot when deciding whether to keep, flip, open, or close exposure.
 7. Run `upsert_hedging_decision.py` with the final action and prices.
 
 ### Action Semantics
@@ -195,8 +196,19 @@ For fixed pair `("META", "MSFT")`:
 - `SHORT_LONG` means short META, long MSFT.
 - `HOLD` means keep existing exposure unchanged or initiate no exposure if
   there is no current position.
-- `CLOSE` exists only in the mechanics tool; output recommendations must use
-  exactly `LONG_SHORT`, `SHORT_LONG`, or `HOLD`.
+- `CLOSE` means close any existing pair exposure and remain flat. If there is
+  no current position, `CLOSE` is equivalent to staying flat.
+
+Output recommendations must use exactly `LONG_SHORT`, `SHORT_LONG`, `HOLD`,
+or `CLOSE`.
+
+Treat the recommendation stream as a persistent position lifecycle:
+
+- Repeating `LONG_SHORT` or `SHORT_LONG` maintains that directional exposure.
+- Switching between `LONG_SHORT` and `SHORT_LONG` flips the pair exposure.
+- `HOLD` leaves the current position unchanged.
+- `CLOSE` exits the current position and leaves the run flat until a later
+  `LONG_SHORT` or `SHORT_LONG` opens new exposure.
 
 ---
 
