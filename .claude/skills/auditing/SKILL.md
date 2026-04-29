@@ -53,7 +53,6 @@ The user invocation specifies:
 | `filing_name` | `10k`, `10q`               | lowercase |
 | `concept_id`  | `us-gaap:AssetsCurrent`    | exact concept name including namespace prefix |
 | `period`      | `FY2021`, `Q3 2022`, `2021-12-31`, `2021-01-01 to 2021-12-31` | user's expression |
-| `model`       | `claude-sonnet-4-6`        | your model identifier from system context |
 
 A typical user request looks like:
 
@@ -63,10 +62,6 @@ for 2023-01-01 to 2023-12-31 in the 10k filing released by rrr on 2023-12-31.
 What's the reported value? What's the actual value calculated from the relevant
 linkbases and US-GAAP taxonomy?
 ```
-
-The data root is configured at server startup (via `--data-root` on
-`auditing_mcp`); you don't need to know the absolute path. Output is written
-under `results/auditing/` (relative to cwd) by `write_audit.py`.
 
 ---
 
@@ -78,10 +73,10 @@ unfolds.
 
 | Tool | Purpose |
 |---|---|
-| ⭐ `find_filing(ticker, filing_name, issue_time)` | Resolve the filing folder under `{data_root}/XBRL/`. Returns `{filing_path, filing_year, files: {htm, cal, xsd, def, lab, pre}, found, message}`. **Always call first** — `filing_path` and `filing_year` feed into the other tools. |
-| ⭐ `get_facts(filing_path, concept_id, period)` | Extract numeric facts whose context period **exactly** matches `period`. Returns `{matched, all_periods_found}`. Use `matched[0]` (non-dimensional first) as the reported value. Use `all_periods_found` to diagnose period misses. |
-| ⭐ `get_calculation_network(filing_path, concept_id)` | Return the calculation-linkbase relationships: `as_parent` (Case A children with weights), `as_child` (Case C parent + siblings), `is_isolated` (Case D). |
-| ⭐ `get_concept_metadata(filing_path, concept_id, taxonomy_year)` | Look up `balance` (`debit`/`credit`/`none`/`unknown`), `period_type` (`instant`/`duration`), `label`, `is_directional_hint` (Case B heuristic). Resolves via the filing's `*.xsd` first, then taxonomy `chunks_core.jsonl`. Pass `taxonomy_year = filing_year` from `find_filing`. |
+| `find_filing(ticker, filing_name, issue_time)` | Resolve the filing folder under `{data_root}/XBRL/`. Returns `{filing_path, filing_year, files: {htm, cal, xsd, def, lab, pre}, found, message}`. **Always call first** — `filing_path` and `filing_year` feed into the other tools. |
+| `get_facts(filing_path, concept_id, period)` | Extract numeric facts whose context period **exactly** matches `period`. Returns `{matched, all_periods_found}`. Use `matched[0]` (non-dimensional first) as the reported value. Use `all_periods_found` to diagnose period misses. |
+| `get_calculation_network(filing_path, concept_id)` | Return the calculation-linkbase relationships: `as_parent` (Case A children with weights), `as_child` (Case C parent + siblings), `is_isolated` (Case D). |
+| `get_concept_metadata(filing_path, concept_id, taxonomy_year)` | Look up `balance` (`debit`/`credit`/`none`/`unknown`), `period_type` (`instant`/`duration`), `label`, `is_directional_hint` (Case B heuristic). Resolves via the filing's `*.xsd` first, then taxonomy `chunks_core.jsonl`. Pass `taxonomy_year = filing_year` from `find_filing`. |
 
 ### Period grammar (for `get_facts`)
 
@@ -396,7 +391,7 @@ python3 .claude/skills/auditing/scripts/write_audit.py \
 | `--model` | Your actual model identifier, e.g. `claude-sonnet-4-6` |
 | `--extracted-value` | Numeric string **verbatim** as it appears in the instance document (may be negative); `"0"` if not found |
 | `--calculated-value` | Numeric string of the correct expected value per Case A/B/C/D; `"0"` if not determinable |
-| `--output-root` | Optional. Default `results/auditing` (relative to cwd). |
+| `--output-root` | **Pass the value the caller specified in the invocation** (e.g. `/io/slot1`). Falls back to `results/auditing` (relative to cwd) only if no value was given — that default is rarely writable inside a sandbox, so omitting it usually causes a `PermissionError`. |
 
 The script writes:
 
@@ -475,8 +470,8 @@ the output file must still contain exactly one JSON line.
 
 ## Implementation approach
 
-1. Parse the user's request into the 6 inputs (`ticker`, `issue_time`,
-   `filing_name`, `concept_id`, `period`, `model`).
+1. Parse the user's request into the 5 inputs (`ticker`, `issue_time`,
+   `filing_name`, `concept_id`, `period`).
 2. `find_filing(ticker, filing_name, issue_time)` → `filing_path`, `filing_year`.
    If `found=false`, stop and report.
 3. `get_concept_metadata(filing_path, concept_id, filing_year)` → `balance`,

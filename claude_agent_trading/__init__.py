@@ -20,6 +20,15 @@ from .hedging_daily import (
     HedgingRangeResult,
     run_hedging_range,
 )
+from .auditing_runner import (
+    AuditingBatchConfig,
+    AuditingBatchResult,
+    AuditingConfig,
+    AuditingResult,
+    AuditingTaskResult,
+    run_auditing,
+    run_auditing_batch,
+)
 
 __all__ = [
     "run_agent",
@@ -37,4 +46,11 @@ __all__ = [
     "HedgingDailyConfig",
     "HedgingRangeResult",
     "run_hedging_range",
+    "AuditingConfig",
+    "AuditingResult",
+    "AuditingBatchConfig",
+    "AuditingBatchResult",
+    "AuditingTaskResult",
+    "run_auditing",
+    "run_auditing_batch",
 ]

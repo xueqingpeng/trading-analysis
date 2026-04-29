@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -109,8 +108,47 @@ def run_benchmark_task(
     """
     benchmark_root = _resolve_benchmark_root(task.benchmark_root)
     project_root = DEFAULT_PROJECT_ROOT.resolve()
-    prompt = _build_prompt(task, benchmark_root)
 
+    # Skills with dedicated runners (auditing) take over the full lifecycle
+    # so batch JSONL and the dedicated CLI subcommand share one code path.
+    if _normalize_task_type(task.task_type) == "auditing":
+        from .auditing_runner import AuditingConfig, run_auditing
+        filing_name = _required_value(task.filing_name, "filing_name").lower()
+        if filing_name not in {"10k", "10q"}:
+            raise ValueError("filing_name must be either '10k' or '10q'")
+        ticker = _required_value(task.ticker, "ticker").lower()
+        issue_time = _required_value(task.issue_time, "issue_time")
+        if len(issue_time) != 8 or not issue_time.isdigit():
+            raise ValueError("issue_time must be an 8-digit YYYYMMDD string")
+        config = AuditingConfig(
+            filing_name=filing_name,
+            ticker=ticker,
+            issue_time=issue_time,
+            concept_id=_required_value(task.concept_id, "concept_id"),
+            period=_required_value(task.period, "period"),
+            case_id=_required_value(task.case_id, "case_id"),
+            benchmark_root=benchmark_root,
+            data_root=Path(task.data_root).expanduser().resolve() if task.data_root else None,
+            output_root=Path(task.output_root).expanduser().resolve() if task.output_root else None,
+            project_root=project_root,
+            model=task.model,
+            max_turns=task.max_turns or 30,
+            max_budget_usd=task.max_budget_usd or 5.0,
+        )
+        audit_result = run_auditing(
+            config,
+            on_assistant_text=on_assistant_text,
+            on_thinking=on_thinking,
+            on_tool_use=on_tool_use,
+            on_stderr=on_stderr,
+        )
+        return BenchmarkRunResult(
+            task=task,
+            prompt=audit_result.prompt,
+            agent_result=audit_result.agent_result,
+        )
+
+    prompt = _build_prompt(task, benchmark_root)
     agent_result = run_agent(
         prompt=prompt,
         cwd=str(project_root),
@@ -247,27 +285,9 @@ def _build_prompt(task: BenchmarkTask, benchmark_root: Path) -> str:
             f"Output: {output_root}."
         )
 
-    if task_type == "auditing":
-        filing_name = _required_value(task.filing_name, "filing_name").lower()
-        if filing_name not in {"10k", "10q"}:
-            raise ValueError("filing_name must be either '10k' or '10q'")
-        ticker = _required_value(task.ticker, "ticker").lower()
-        issue_time = _required_value(task.issue_time, "issue_time")
-        if len(issue_time) != 8 or not issue_time.isdigit():
-            raise ValueError("issue_time must be an 8-digit YYYYMMDD string")
-        concept_id = _required_value(task.concept_id, "concept_id")
-        period = _required_value(task.period, "period")
-        case_id = _required_value(task.case_id, "case_id")
-        data_root = _resolve_path(task.data_root, benchmark_root / "data" / "auditing")
-        output_root = _resolve_output_dir(task.output_root, benchmark_root / "results" / "auditing")
-        issue_date = datetime.strptime(issue_time, "%Y%m%d").strftime("%Y-%m-%d")
-        return (
-            f"Please audit the value of {concept_id} for {period} in the {filing_name} filing "
-            f"released by {ticker} on {issue_date}. What's the reported value? What's the actual "
-            f"value calculated from the relevant linkbases and US-GAAP taxonomy? (id: {case_id}) "
-            f"The input data is at {data_root}, please save the output to {output_root}."
-        )
-
+    # auditing is handled directly by run_auditing in run_benchmark_task —
+    # _build_prompt only handles task types that share the generic agent
+    # invocation path (no skill-specific MCP injection).
     raise ValueError(
         f"Unsupported task_type '{task.task_type}'. "
         f"Expected one of: trading, report_generation, report_evaluation, auditing"

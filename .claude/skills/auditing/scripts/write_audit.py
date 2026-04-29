@@ -89,7 +89,14 @@ def main() -> None:
         f"{_sanitize(args.model)}.json"
     )
     out_path = Path(args.output_root) / filename
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        parser.error(
+            f"Cannot create output directory {out_path.parent}: {exc}. "
+            f"Pass --output-root=<writable path> — use whatever directory "
+            f"the caller specified in the invocation (e.g. /io/slot1)."
+        )
 
     payload = json.dumps(
         {

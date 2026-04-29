@@ -28,6 +28,15 @@ from .hedging_daily import (
     HedgingRangeResult,
     run_hedging_range,
 )
+from .auditing_runner import (
+    AuditingBatchConfig,
+    AuditingBatchResult,
+    AuditingConfig,
+    AuditingResult,
+    AuditingTaskResult,
+    run_auditing,
+    run_auditing_batch,
+)
 
 
 def main() -> None:
@@ -76,16 +85,12 @@ def main() -> None:
     report_eval_parser.add_argument("--reports-root", default=None, help="Parent directory of report_generation outputs")
     report_eval_parser.add_argument("--output-root", default=None, help="Output directory for evaluation JSON")
 
-    auditing_parser = subparsers.add_parser("auditing", help="Run the auditing skill")
-    _add_single_task_common_args(auditing_parser)
-    auditing_parser.add_argument("--filing-name", required=True, choices=["10k", "10q"], help="Filing type")
-    auditing_parser.add_argument("--ticker", required=True, help="Lowercase company ticker in filing folders")
-    auditing_parser.add_argument("--issue-time", required=True, help="Issue date in YYYYMMDD format")
-    auditing_parser.add_argument("--concept-id", required=True, help="Concept identifier, e.g. us-gaap:AssetsCurrent")
-    auditing_parser.add_argument("--period", required=True, help="Requested period string")
-    auditing_parser.add_argument("--case-id", required=True, help="Task identifier used in output filename")
-    auditing_parser.add_argument("--data-root", default=None, help="Auditing data directory")
-    auditing_parser.add_argument("--output-root", default=None, help="Output directory for auditing JSON")
+    auditing_parser = subparsers.add_parser(
+        "auditing",
+        help="Run the auditing skill — one case via per-case flags, or many "
+             "cases via --tasks-file batch mode",
+    )
+    _add_auditing_args(auditing_parser)
 
     args = parser.parse_args()
     callbacks = _build_callbacks(args.verbose)
@@ -115,6 +120,19 @@ def main() -> None:
         hedging_result = _run_hedging_from_args(args, callbacks)
         _emit_hedging_range_result(hedging_result, as_json=args.json)
         if hedging_result.config.fail_fast and hedging_result.num_errors > 0:
+            sys.exit(1)
+        return
+
+    if args.command == "auditing":
+        if args.tasks_file:
+            batch_result = _run_auditing_batch_from_args(args, callbacks)
+            _emit_auditing_batch_result(batch_result, as_json=args.json)
+            if batch_result.config.fail_fast and batch_result.num_errors > 0:
+                sys.exit(1)
+            return
+        auditing_result = _run_auditing_from_args(args, callbacks)
+        _emit_auditing_result(auditing_result, as_json=args.json)
+        if auditing_result.agent_result.is_error:
             sys.exit(1)
         return
 
@@ -182,17 +200,10 @@ def _task_from_args(args: argparse.Namespace) -> BenchmarkTask:
             }
         )
     else:
-        payload.update(
-            {
-                "filing_name": args.filing_name,
-                "ticker": args.ticker,
-                "issue_time": args.issue_time,
-                "concept_id": args.concept_id,
-                "period": args.period,
-                "case_id": args.case_id,
-                "data_root": args.data_root,
-                "output_root": args.output_root,
-            }
+        raise ValueError(
+            f"_task_from_args does not handle task_type={task_type!r}. "
+            "trading / hedging / auditing each have dedicated runners; "
+            "this helper is only for report-generation / report-evaluation."
         )
     return BenchmarkTask(**payload)
 
@@ -444,6 +455,248 @@ def _emit_hedging_range_result(
         f"\nTotal: {len(result.per_day)} day(s), "
         f"{result.num_errors} error(s), "
         f"${result.total_cost_usd:.4f}"
+    )
+
+
+# ------------------------ auditing (single-shot) ------------------------
+
+def _add_auditing_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--benchmark-root", default=None,
+        help="Optional. financial_agentic_benchmark root directory used to "
+             "derive default --data-root (= <root>/data/auditing) and "
+             "--output-root (= <root>/results/auditing). Not needed when both "
+             "--data-root and --output-root are passed explicitly.",
+    )
+    # Mode: single case (six --filing-name/--ticker/... flags) OR batch via --tasks-file.
+    # --tasks-file takes precedence; the per-case flags are only required in
+    # single-case mode. argparse's `required` is checked at validation time
+    # in _run_auditing_from_args (so --tasks-file can omit them).
+    parser.add_argument(
+        "--tasks-file", default=None,
+        help="Path to a text file with one auditing prompt per line. Each line "
+             "may contain {env_dir} / {result_dir} placeholders, which are "
+             "substituted with --data-root / --output-root before sending. "
+             "When set, the agent runs each prompt as an independent audit "
+             "in a single docker invocation. Mutually exclusive with the "
+             "per-case flags below.",
+    )
+    parser.add_argument(
+        "--filing-name", default=None, choices=["10k", "10q"],
+        help="(single-case only) Filing type, lowercase",
+    )
+    parser.add_argument(
+        "--ticker", default=None,
+        help="(single-case only) Lowercase company ticker as it appears in filing folder names",
+    )
+    parser.add_argument(
+        "--issue-time", default=None,
+        help="(single-case only) Filing issue date in YYYYMMDD format",
+    )
+    parser.add_argument(
+        "--concept-id", default=None,
+        help="(single-case only) Concept identifier including namespace, e.g. us-gaap:AssetsCurrent",
+    )
+    parser.add_argument(
+        "--period", default=None,
+        help="(single-case only) Requested period string (e.g. 'FY2023', "
+             "'Q3 2023', '2023-12-31', '2023-01-01 to 2023-12-31')",
+    )
+    parser.add_argument(
+        "--case-id", default=None,
+        help="(single-case only) Task identifier embedded in the prompt (for benchmark traceability)",
+    )
+    parser.add_argument(
+        "--data-root", default=None,
+        help="Auditing data directory (default: <benchmark-root>/data/auditing). "
+             "Injected into auditing_mcp via --data-root.",
+    )
+    parser.add_argument(
+        "--output-root", default=None,
+        help="Output directory for the audit JSON (default: "
+             "<benchmark-root>/results/auditing). Passed to write_audit.py "
+             "via --output-root.",
+    )
+    parser.add_argument("--model", default=None, help="Claude model override")
+    parser.add_argument("--max-turns", type=int, default=30, help="Agent max turns")
+    parser.add_argument(
+        "--max-budget", type=float, default=5.0,
+        help="Cost cap in USD per task (default 5.0; auditing tasks are typically heavier than trading days)",
+    )
+    parser.add_argument(
+        "--fail-fast", action="store_true",
+        help="(batch mode only) Stop after the first task that returns an error",
+    )
+    parser.add_argument(
+        "--no-resume", action="store_true",
+        help="(batch mode only) Re-run every task even if its predicted output "
+             "file already exists. Default behaviour is to skip cases whose "
+             "output file is already present (resume an interrupted batch).",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Print assistant and tool events to stderr",
+    )
+    parser.add_argument("--json", action="store_true", help="Print the final result as JSON")
+
+
+def _resolve_optional_benchmark_root(
+    raw: str | None, *, data_root: str | None, output_root: str | None
+) -> Path | None:
+    """Validate --benchmark-root if given; require it only when defaults are needed."""
+    if raw:
+        path = Path(raw).expanduser().resolve()
+        if not path.is_dir():
+            raise SystemExit(
+                f"--benchmark-root does not exist or is not a directory: {path}"
+            )
+        return path
+    if not data_root or not output_root:
+        raise SystemExit(
+            "Provide either --benchmark-root, or both --data-root and "
+            "--output-root explicitly."
+        )
+    return None
+
+
+def _run_auditing_from_args(
+    args: argparse.Namespace, callbacks: dict[str, object]
+) -> AuditingResult:
+    benchmark_root = _resolve_optional_benchmark_root(
+        args.benchmark_root, data_root=args.data_root, output_root=args.output_root,
+    )
+
+    # Single-case mode requires the six per-case flags (argparse can't enforce
+    # this directly because --tasks-file is the alternative).
+    missing = [
+        flag for flag, val in [
+            ("--filing-name", args.filing_name),
+            ("--ticker", args.ticker),
+            ("--issue-time", args.issue_time),
+            ("--concept-id", args.concept_id),
+            ("--period", args.period),
+            ("--case-id", args.case_id),
+        ] if not val
+    ]
+    if missing:
+        raise SystemExit(
+            "Single-case auditing requires: "
+            f"{', '.join(missing)}. Or pass --tasks-file for batch mode."
+        )
+
+    config = AuditingConfig(
+        filing_name=args.filing_name.lower(),
+        ticker=args.ticker.lower(),
+        issue_time=args.issue_time,
+        concept_id=args.concept_id,
+        period=args.period,
+        case_id=args.case_id,
+        benchmark_root=benchmark_root,
+        data_root=Path(args.data_root).expanduser().resolve() if args.data_root else None,
+        output_root=Path(args.output_root).expanduser().resolve() if args.output_root else None,
+        project_root=DEFAULT_PROJECT_ROOT.resolve(),
+        model=args.model,
+        max_turns=args.max_turns,
+        max_budget_usd=args.max_budget,
+    )
+    return run_auditing(config, **callbacks)
+
+
+def _run_auditing_batch_from_args(
+    args: argparse.Namespace, callbacks: dict[str, object]
+) -> AuditingBatchResult:
+    benchmark_root = _resolve_optional_benchmark_root(
+        args.benchmark_root, data_root=args.data_root, output_root=args.output_root,
+    )
+
+    tasks_file = Path(args.tasks_file).expanduser().resolve()
+    if not tasks_file.is_file():
+        raise SystemExit(f"--tasks-file does not exist: {tasks_file}")
+
+    config = AuditingBatchConfig(
+        tasks_file=tasks_file,
+        benchmark_root=benchmark_root,
+        data_root=Path(args.data_root).expanduser().resolve() if args.data_root else None,
+        output_root=Path(args.output_root).expanduser().resolve() if args.output_root else None,
+        project_root=DEFAULT_PROJECT_ROOT.resolve(),
+        model=args.model,
+        max_turns=args.max_turns,
+        max_budget_usd=args.max_budget,
+        fail_fast=args.fail_fast,
+        resume=not args.no_resume,
+    )
+
+    def _format_complete(r: AuditingTaskResult) -> str:
+        if r.skipped:
+            return (
+                f"[task] {r.case_id or '?'} SKIP (resume) "
+                f"→ {r.output_path}"
+            )
+        return (
+            f"[task] {r.case_id or '?'} "
+            f"{'ERROR' if r.agent_result.is_error else 'OK'} "
+            f"cost=${r.agent_result.cost_usd:.4f} "
+            f"turns={r.agent_result.turns} "
+            f"→ {r.output_path or '(no output file)'}"
+        )
+
+    task_callbacks = {
+        "on_task_start": lambda label: print(
+            f"[task] {label} → invoking agent", file=sys.stderr
+        ),
+        "on_task_complete": lambda r: print(_format_complete(r), file=sys.stderr),
+    }
+    return run_auditing_batch(config, **callbacks, **task_callbacks)
+
+
+def _emit_auditing_batch_result(
+    result: AuditingBatchResult, *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+
+    print(f"Auditing batch: {result.config.tasks_file}")
+    for t in result.per_task:
+        dest = str(t.output_path) if t.output_path else "(no output)"
+        if t.skipped:
+            print(f"  {t.case_id or '?':<12}  SKIP    (already present)         → {dest}")
+            continue
+        status = "ERROR" if t.agent_result.is_error else "OK"
+        print(
+            f"  {t.case_id or '?':<12}  {status:<5}  "
+            f"${t.agent_result.cost_usd:.4f}  "
+            f"turns={t.agent_result.turns}  → {dest}"
+        )
+    print(
+        f"\nTotal: {len(result.per_task)} task(s), "
+        f"{result.num_skipped} skipped, "
+        f"{result.num_errors} error(s), "
+        f"${result.total_cost_usd:.4f}"
+    )
+
+
+def _emit_auditing_result(result: AuditingResult, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+
+    ar = result.agent_result
+    status = "ERROR" if ar.is_error else "OK"
+    cfg = result.config
+    print(
+        f"{status} auditing  "
+        f"{cfg.filing_name}/{cfg.ticker}/{cfg.issue_time}  "
+        f"{cfg.concept_id}  {cfg.period}"
+    )
+    if ar.result:
+        print(ar.result)
+    dest = str(result.output_path) if result.output_path else "(no output file)"
+    print(f"  → {dest}")
+    print(
+        f"\n--- Cost: ${ar.cost_usd:.4f} | Turns: {ar.turns} | "
+        f"Duration: {ar.duration_ms}ms ---",
+        file=sys.stderr,
     )
 
 
