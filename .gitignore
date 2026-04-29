@@ -45,6 +45,6 @@ runs/
 financial_agentic_benchmark/
 .codex/
 context_as_world/
-env/
+*_env/
 
 !.claude

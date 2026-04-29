@@ -30,4 +30,11 @@ financial_agentic_benchmark
 .codex
 context_as_world
 
+# Local data — mounted into the container at runtime, no need to bake into image
+auditing_env
+*.duckdb
+prompts
+_results
+results
+
 *.log
