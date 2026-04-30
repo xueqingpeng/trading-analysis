@@ -1,9 +1,9 @@
 # ── Authentication (pick one) ──────────────────────────
 
 # Direct Anthropic API
-ANTHROPIC_API_KEY=sk-ant-oat01-zdEf1OAX5bj2rgu3Q0bpf2JgQV64vI7Y
-ANTHROPIC_BASE_URL= https://chat.coai.top/code
-CLAUDE_MODEL=gpt-5.4
+ANTHROPIC_API_KEY=
+ANTHROPIC_BASE_URL= 
+CLAUDE_MODEL=
 
 # Or Azure Foundry (all three required)
 # ANTHROPIC_FOUNDRY_RESOURCE=your-resource
