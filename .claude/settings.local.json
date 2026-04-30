@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(gh repo:*)",
+      "WebSearch",
+      "Bash(git --version)",
+      "Bash(pip install:*)",
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import claude_agent_sdk; print\\('sdk ok'\\)\")",
+      "Bash(claude --version)",
+      "Bash(python run_benchmark.py --help)",
+      "Bash(python run_benchmark.py auditing --help)",
+      "Bash(claude config:*)",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('apiKey prefix:', str\\(d.get\\('apiKey',''\\)\\)[:15]\\); print\\('baseUrl:', d.get\\('baseApiUrl','not set'\\)\\)\")",
+      "Bash(where claude:*)",
+      "Bash(ANTHROPIC_API_KEY=\"sk-mkzHt3qm9jekG6peB7MKR1Xptjyv9ltRQs1vg6ayN8LuDq2S\" ANTHROPIC_BASE_URL=\"https://api.openai-proxy.org/anthropic\" claude --print \"say hi\")",
+      "Bash(ANTHROPIC_API_KEY=\"sk-mkzHt3qm9jekG6peB7MKR1Xptjyv9ltRQs1vg6ayN8LuDq2S\" ANTHROPIC_BASE_URL=\"https://api.openai-proxy.org/anthropic\" claude --dangerously-skip-permissions --print \"say hi\")",
+      "Bash(echo \"exit: $?\")",
+      "Bash(python:*)",
+      "Read(//usr/**)",
+      "Read(//usr/local/**)",
+      "Bash(ls /usr/bin/python*)",
+      "Bash(ls /usr/local/bin/python*)",
+      "Bash(command -v py)",
+      "Bash(kill %1)",
+      "Bash(markdown\\\\\")",
+      "Bash(\\\\\")",
+      "mcp__report_generation_mcp__get_weekly_metrics",
+      "mcp__report_generation_mcp__list_peers",
+      "mcp__report_generation_mcp__get_filing_highlights",
+      "mcp__report_generation_mcp__is_trading_day",
+      "mcp__report_generation_mcp__get_news_digest"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "report_generation_mcp"
+  ]
+}

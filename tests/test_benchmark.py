@@ -29,16 +29,32 @@ class BenchmarkRunnerTests(unittest.TestCase):
     def test_build_report_evaluation_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            (root / "data" / "trading").mkdir(parents=True)
+            db = root / "data" / "trading_env.duckdb"
+            db.parent.mkdir(parents=True)
+            db.write_text("")
             (root / "results" / "report_generation").mkdir(parents=True)
             task = BenchmarkTask(
                 task_type="report_evaluation",
                 ticker="TSLA",
                 target_agent="codex",
                 target_model="gpt-5",
+                db_path=str(db),
             )
             prompt = _build_prompt(task, root)
             self.assertIn("Evaluate the codex/TSLA/gpt-5 run.", prompt)
+            self.assertIn(str(db.resolve()), prompt)
+
+    def test_build_report_generation_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "results" / "report_generation").mkdir(parents=True)
+            task = BenchmarkTask(task_type="report_generation", ticker="TSLA")
+            prompt = _build_prompt(task, root)
+            self.assertIn("Generate equity research report for TSLA.", prompt)
+            self.assertIn(
+                str((root / "results" / "report_generation").resolve().as_posix()),
+                prompt,
+            )
 
     def test_load_tasks_file_reads_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -79,6 +95,34 @@ class BenchmarkRunnerTests(unittest.TestCase):
             self.assertFalse(result.agent_result.is_error)
             self.assertEqual(result.agent_result.result, "done")
             mock_run_agent.assert_called_once()
+
+    @patch("claude_agent_trading.benchmark.run_agent")
+    def test_report_evaluation_task_passes_mcp_servers(self, mock_run_agent) -> None:
+        mock_run_agent.return_value = AgentResult(
+            result="done", cost_usd=0.1, turns=2,
+            duration_ms=100, session_id="sess-2", is_error=False,
+        )
+        with tempfile.TemporaryDirectory() as benchmark_tmp:
+            benchmark_root = Path(benchmark_tmp)
+            db = benchmark_root / "data" / "trading_env.duckdb"
+            db.parent.mkdir(parents=True)
+            db.write_text("")
+            reports_root = benchmark_root / "results" / "report_generation"
+            reports_root.mkdir(parents=True)
+
+            run_benchmark_task(
+                BenchmarkTask(
+                    task_type="report_evaluation",
+                    ticker="TSLA",
+                    target_agent="codex",
+                    target_model="gpt-5",
+                    db_path=str(db),
+                    benchmark_root=str(benchmark_root),
+                )
+            )
+
+            self.assertIn("mcp_servers", mock_run_agent.call_args.kwargs)
+            self.assertIsNotNone(mock_run_agent.call_args.kwargs["mcp_servers"])
 
     @patch("claude_agent_trading.benchmark.run_agent")
     def test_batch_continues_after_error_by_default(self, mock_run_agent) -> None:

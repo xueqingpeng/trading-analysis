@@ -22,7 +22,7 @@ export CLAUDE_MODEL=gpt-5.4                             # or claude-sonnet-4-6, 
 
 ./run_docker.sh trading --verbose \
     --symbol TSLA --start 2025-03-03 --end 2025-03-31 \
-    --db-path ./env.duckdb \
+    --db-path ./data/trading.duckdb \
     --output  ./results/trading
 ```
 
@@ -69,13 +69,14 @@ Model resolution order: CLI `--model` > `CLAUDE_MODEL` env > default `claude-son
 # trading — daily-loop skill over a date range, queries DuckDB via MCP
 python run_benchmark.py trading \
     --symbol TSLA --start 2025-03-03 --end 2025-03-31 \
-    --db-path  ./env.duckdb \
+    --db-path  /path/to/trading.duckdb \
     --output   /path/to/results/trading
 
-# report-generation — weekly equity reports over a 3-month window
+# report-generation — daily investment advice reports over a date range, queries DuckDB via MCP
 python run_benchmark.py report-generation \
-    --benchmark-root /path/to/financial_agentic_benchmark \
-    --ticker TSLA
+    --symbol TSLA --start 2025-03-03 --end 2025-03-31 \
+    --db-path  /path/to/trading.duckdb \
+    --output   /path/to/results/report_generation
 
 # report-evaluation — scores reports produced by report-generation
 python run_benchmark.py report-evaluation \
@@ -95,7 +96,7 @@ python run_benchmark.py auditing \
 Prepare a JSONL file (one task per line, each including `benchmark_root`):
 
 ```jsonl
-{"task_type":"report_generation","ticker":"TSLA","benchmark_root":"/path/to/financial_agentic_benchmark"}
+{"task_type":"trading","ticker":"TSLA","benchmark_root":"/path/to/financial_agentic_benchmark"}
 {"task_type":"auditing","ticker":"rrr","filing_name":"10k","issue_time":"20231231","concept_id":"us-gaap:AssetsCurrent","period":"2023-01-01 to 2023-12-31","case_id":"mr_1","benchmark_root":"/path/to/financial_agentic_benchmark"}
 ```
 
@@ -144,7 +145,7 @@ export CLAUDE_MODEL=gpt-5.4                 # or claude-sonnet-4-6, gpt-4.1, etc
 
 ./run_docker.sh trading --verbose \
     --symbol TSLA --start 2025-03-03 --end 2025-03-31 \
-    --db-path ./env.duckdb \
+    --db-path ./data/trading.duckdb \
     --output  ./results/trading
 ```
 
@@ -202,197 +203,24 @@ docker exec <container-id> cat /tmp/claude_proxy.log
 
 ---
 
-## Task reference — Docker CLI vs raw prompts
-
-There are two distinct ways to invoke a skill:
-
-1. **Docker / runner CLI** — `./run_docker.sh <task> ...`. The runner constructs a per-day / per-sample prompt and sends it to the agent on your behalf. This is what you normally use.
-2. **Raw prompt** — what the agent actually sees inside the SDK call. Useful if you want to drive a skill yourself (e.g. with `claude` CLI directly, your own SDK script, or a different orchestrator). The skill files in `.claude/skills/` work the same regardless of who sends the prompt.
-
-The five skills below show both forms. The raw prompts are the verbatim strings produced by `build_*_prompt` in `claude_agent_trading/`; you can paste them straight into a `claude` CLI invocation.
-
-### trading — daily BUY/SELL/HOLD for one stock
-
-**Runner (loops over the date range, one agent per day):**
-
-```bash
-./run_docker.sh trading --verbose \
-    --symbol TSLA --start 2025-03-03 --end 2025-03-31 \
-    --db-path ./env.duckdb \
-    --output  ./results/trading
-```
-
-**Raw prompt sent to the agent for ONE day:**
-
-```
-Trade TSLA on 2025-03-05.
-
-Your turn is NOT complete unless you have actually invoked the Bash tool to run
-`python3 .claude/skills/trading/scripts/upsert_decision.py` with all required
-flags. A text-only response that merely describes or announces the decision is
-a FAILURE — the result file will not exist on disk. Do not stop, do not write
-a summary, do not say the decision has been recorded until the Bash call has
-returned its one-line JSON success summary.
-
-When calling upsert_decision.py, pass --output-root=/io/slot1 and
---model=gpt-5.4 exactly as given (do not substitute your own model name).
-```
-
-**Resume behaviour:** every iterated day is re-sent to the agent. The output is one JSON per `--symbol` / `--model`; re-running **overwrites** any date that already has a record (via `upsert_decision.py`'s upsert-by-date). There is no auto-skip — to fill only gaps, narrow `--start` / `--end`.
-
-### hedging — daily pair-trading decision
-
-**Runner (loops over the date range; first iterated day is `IS_FIRST_DAY=True` and triggers pair selection, every later day reads the pair from disk):**
-
-```bash
-./run_docker.sh hedging --verbose \
-    --start 2025-03-03 --end 2025-05-31 \
-    --db-path ./env.duckdb \
-    --output  ./results/hedging
-```
-
-**Raw prompt — first day (IS_FIRST_DAY=True):**
-
-```
-Start hedging on 2025-03-03 with IS_FIRST_DAY=True.
-
-Your turn is NOT complete unless you have actually invoked the Bash tool to run
-`python3 .claude/skills/hedging/scripts/upsert_hedging_decision.py` with all
-required flags. A text-only response that merely describes or announces the
-decision is a FAILURE — the result file will not exist on disk. Do not stop,
-do not write a summary, do not say the decision has been recorded until the
-Bash call has returned its one-line JSON success summary.
-
-When calling upsert_hedging_decision.py, pass --output-root=/io/slot1 and
---model=gpt-5.4 exactly as given (do not substitute your own model name).
-```
-
-**Raw prompt — subsequent days (IS_FIRST_DAY=False, the default):**
-
-```
-Run hedging for 2025-03-04 with IS_FIRST_DAY=False.
-
-[same trailing Bash + --output-root + --model clauses as above, with
-upsert_hedging_decision.py]
-```
-
-**Resume behaviour:** the runner checks `--output` first. If a `hedging_*_<model>.json` already exists there, **every** iterated day uses `IS_FIRST_DAY=False` and reuses the pair already on disk — the first day does **not** re-trigger pair selection. Records are upserted by date (existing dates overwritten). To force re-selection of the pair, point `--output` at a fresh empty directory, or delete the existing `hedging_*.json`.
-
-### auditing — XBRL numeric fact audit
-
-**Runner — single case (per-case flags):**
-
-```bash
-./run_docker.sh auditing --verbose \
-    --filing-name 10k --ticker rrr --issue-time 20231231 \
-    --concept-id us-gaap:AssetsCurrent \
-    --period "2023-01-01 to 2023-12-31" --case-id mr_1 \
-    --data-root   ./auditing_env \
-    --output-root ./results/auditing
-```
-
-**Runner — batch (one prompt per line in a text file, with auto-resume on existing outputs):**
-
-```bash
-./run_docker.sh auditing --verbose \
-    --tasks-file  ./prompts/auditing.txt \
-    --data-root   ./auditing_env \
-    --output-root ./results/auditing
-```
-
-The tasks file uses `{env_dir}` / `{result_dir}` placeholders that the runner substitutes; resume detects already-written outputs by predicting `write_audit.py`'s filename and skipping.
-
-**Raw prompt sent to the agent for ONE case:**
-
-```
-Please audit the value of us-gaap:AssetsCurrent for 2023-01-01 to 2023-12-31
-in the 10k filing released by rrr on 2023-12-31. What's the reported value?
-What's the actual value calculated from the relevant linkbases and US-GAAP
-taxonomy? (id: mr_1) The input data is at /io/slot0/auditing.
-
-Your turn is NOT complete unless you have actually invoked the Bash tool to run
-`python3 .claude/skills/auditing/scripts/write_audit.py` with all required
-flags. A text-only response that merely describes the audit is a FAILURE —
-the result file will not exist on disk. Do not stop, do not write a summary,
-do not say the audit has been recorded until the Bash call has returned its
-one-line JSON success summary.
-
-When calling write_audit.py, pass --output-root=/io/slot1 and --model=gpt-5.4
-exactly as given (do not substitute your own model name).
-```
-
-**Resume behaviour:**
-- **Single-case mode** — always re-runs. `write_audit.py` overwrites the predicted filename if it exists.
-- **Batch mode** — `resume=True` by default. Before each prompt the runner predicts the exact filename `write_audit.py` would produce and **skips** the case if that file is already in `--output-root`. Skipped cases cost $0 and show up as `SKIP (resume)` in the per-task log. Cases that errored out leave no output file → automatically retried on the next run. Pass `--no-resume` to force re-run of every case.
-
-### report-generation — weekly equity reports over 3 months
-
-**Runner (one shot):**
-
-```bash
-./run_docker.sh report-generation --verbose \
-    --benchmark-root /path/to/financial_agentic_benchmark \
-    --ticker TSLA
-```
-
-**Raw prompt:**
-
-```
-Please generate weekly equity reports for TSLA. The input data is at
-/io/slot0/data/trading, please save the output to
-/io/slot1/results/report_generation.
-```
-
-### report-evaluation — score reports a previous report-generation run produced
-
-**Runner:**
-
-```bash
-./run_docker.sh report-evaluation --verbose \
-    --benchmark-root /path/to/financial_agentic_benchmark \
-    --ticker TSLA \
-    --target-agent codex --target-model gpt-5
-```
-
-**Raw prompt:**
-
-```
-Evaluate the codex/TSLA/gpt-5 run. Reports parent:
-/io/slot0/results/report_generation. Data: /io/slot0/data/trading.
-Output: /io/slot1/results/report_evaluation.
-```
-
-### Driving the skills directly via `claude` CLI
-
-The raw prompts above are everything a Claude Code agent needs — the SDK / CLI auto-discovers `.claude/skills/<name>/SKILL.md` and the matching `.mcp.json` from cwd. So you can also drive a skill without the runner at all:
-
-```bash
-cd /path/to/trading-analysis        # so .claude/skills/ is discoverable
-claude --print --model gpt-5.4 \
-    --mcp-config .claude/skills/auditing/.mcp.json \
-    "Please audit the value of us-gaap:AssetsCurrent for 2023-01-01 to 2023-12-31
-in the 10k filing released by rrr on 2023-12-31..."
-```
-
-The runner adds three things on top of the raw prompt: (1) per-day / per-case looping, (2) MCP `--db-path` / `--data-root` injection, (3) PermissionError-friendly `--output-root` / `--model` pinning. If you bypass the runner, you take responsibility for those three yourself.
-
----
-
 ## Python API
 
 ```python
-from claude_agent_trading import BenchmarkTask, run_benchmark_task
+from claude_agent_trading import ReportGenerationDailyConfig, run_report_generation_range
+from datetime import date
+from pathlib import Path
 
-result = run_benchmark_task(
-    BenchmarkTask(
-        task_type="report_generation",
-        ticker="TSLA",
-        benchmark_root="/path/to/financial_agentic_benchmark",
+result = run_report_generation_range(
+    ReportGenerationDailyConfig(
+        symbol="TSLA",
+        start=date(2025, 3, 3),
+        end=date(2025, 3, 31),
+        output_dir=Path("./results/report_generation"),
+        db_path=Path("./data/trading.duckdb"),
     )
 )
 
-print(result.agent_result.result)
-print(f"Cost: ${result.agent_result.cost_usd:.4f}")
+print(f"Cost: ${result.total_cost_usd:.4f}")
 ```
 
 ---
@@ -403,7 +231,7 @@ print(f"Cost: ${result.agent_result.cost_usd:.4f}")
 trading-analysis/
 ├── .claude/skills/             # Agent SDK auto-discovers these
 │   ├── trading/                # SKILL.md + scripts/ (MCP server, upsert_decision.py, ...)
-│   ├── hedging/
+│   ├── pair_trading/
 │   ├── report_generation/
 │   ├── report_evaluation/
 │   └── auditing/

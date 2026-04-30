@@ -1,11 +1,10 @@
-"""Daily-loop orchestrator for the single-day `trading` skill + MCP.
+"""Daily-loop orchestrator for the single-day `report_generation` skill + MCP.
 
-The heavy lifting lives in `<project_root>/.claude/skills/trading/SKILL.md` and
-the `trading_mcp` MCP server (spawned by Claude CLI via `.mcp.json`). This
-module just loops over dates and invokes one agent per day. The daily prompt
+The heavy lifting lives in `<project_root>/.claude/skills/report_generation/SKILL.md`
+and the `report_generation_mcp` MCP server (spawned by Claude CLI via `.mcp.json`).
+This module just loops over dates and invokes one agent per day. The daily prompt
 tells the agent to pass `--output-root=<output_dir>` to the skill's
-`upsert_decision.py`, so the result JSON is written directly to the
-user-specified directory.
+`upsert_report.py`, so the result is written directly to the user-specified directory.
 """
 
 from __future__ import annotations
@@ -26,8 +25,8 @@ logger = logging.getLogger("claude_agent_framework")
 
 
 @dataclass(slots=True)
-class TradingDailyConfig:
-    """Config for a date-range trading run driven day-by-day."""
+class ReportGenerationDailyConfig:
+    """Config for a date-range report-generation run driven day-by-day."""
 
     symbol: str
     start: date
@@ -43,7 +42,7 @@ class TradingDailyConfig:
 
 
 @dataclass(slots=True)
-class DailyResult:
+class DailyReportResult:
     date: str
     agent_result: AgentResult
     output_path: Path | None
@@ -62,9 +61,9 @@ class DailyResult:
 
 
 @dataclass(slots=True)
-class TradingRangeResult:
-    config: TradingDailyConfig
-    per_day: list[DailyResult]
+class ReportGenerationRangeResult:
+    config: ReportGenerationDailyConfig
+    per_day: list[DailyReportResult]
     total_cost_usd: float
     num_errors: int
 
@@ -87,15 +86,10 @@ class TradingRangeResult:
 def build_daily_prompt(
     model: str, symbol: str, target_date: str, output_dir: Path
 ) -> str:
-    """Build the single-day trading prompt sent to the agent.
-
-    Embeds the caller-supplied `output_dir` so the agent passes
-    `--output-root` to `upsert_decision.py` and the result JSON is written
-    directly there (no intermediate copy).
-    """
+    """Build the single-day report-generation prompt sent to the agent."""
     return (
-        f"you are {model}. Trade {symbol} on {target_date}. "
-        f"When calling upsert_decision.py, pass --output-root={output_dir.as_posix()}."
+        f"you are {model}. Generate equity research report for {symbol} on {target_date}. "
+        f"When calling upsert_report.py, pass --output-root={output_dir.as_posix()}."
     )
 
 
@@ -112,29 +106,24 @@ def iter_trading_days(
         cur += timedelta(days=1)
 
 
-def run_trading_range(
-    config: TradingDailyConfig,
+def run_report_generation_range(
+    config: ReportGenerationDailyConfig,
     *,
     on_assistant_text: Callable[[str], None] | None = None,
     on_thinking: Callable[[str], None] | None = None,
     on_tool_use: Callable[[str, dict], None] | None = None,
     on_stderr: Callable[[str], None] | None = None,
     on_day_start: Callable[[str], None] | None = None,
-    on_day_complete: Callable[[DailyResult], None] | None = None,
-) -> TradingRangeResult:
-    """Run the trading skill once per day over [config.start, config.end].
-
-    The daily prompt tells the agent to pass `--output-root=<output_dir>`
-    to `upsert_decision.py`, so the skill writes `trading_{SYMBOL}_*.json`
-    straight into `config.output_dir`.
-    """
+    on_day_complete: Callable[[DailyReportResult], None] | None = None,
+) -> ReportGenerationRangeResult:
+    """Run the report_generation skill once per day over [config.start, config.end]."""
     _precheck(config)
     db_path_abs = config.db_path.expanduser().resolve()
     mcp_servers = _load_mcp_servers(config.project_root, db_path_abs)
     resolved_model = config.model or resolve_model()
     output_dir_abs = config.output_dir.resolve()
 
-    per_day: list[DailyResult] = []
+    per_day: list[DailyReportResult] = []
     total_cost = 0.0
     num_errors = 0
 
@@ -164,7 +153,7 @@ def run_trading_range(
 
         output_path = _find_output_file(output_dir_abs, config.symbol)
 
-        day_result = DailyResult(
+        day_result = DailyReportResult(
             date=target_date, agent_result=agent_result, output_path=output_path
         )
         per_day.append(day_result)
@@ -179,7 +168,7 @@ def run_trading_range(
             logger.warning("fail-fast: stopping after error on %s", target_date)
             break
 
-    return TradingRangeResult(
+    return ReportGenerationRangeResult(
         config=config,
         per_day=per_day,
         total_cost_usd=total_cost,
@@ -187,52 +176,36 @@ def run_trading_range(
     )
 
 
-SKILL_DIR = Path(".claude") / "skills" / "trading"
+SKILL_DIR = Path(".claude") / "skills" / "report_generation"
 SKILL_MCP_JSON = SKILL_DIR / ".mcp.json"
-SKILL_MCP_SCRIPT = SKILL_DIR / "scripts" / "mcp" / "trading_mcp.py"
+SKILL_MCP_SCRIPT = SKILL_DIR / "scripts" / "mcp" / "report_generation_mcp.py"
 
 
 def _load_mcp_servers(project_root: Path, db_path: Path) -> dict:
-    """Parse the skill-local .mcp.json into the dict `mcp_servers` wants.
-
-    The Agent SDK does NOT auto-read .mcp.json (that's a Claude Code CLI
-    convention), so it doesn't care where the file lives — we parse it
-    ourselves. We put it under `.claude/skills/trading/` to keep the whole
-    skill (SKILL.md + MCP config + server script + DuckDB) self-contained.
-    Relative `args` paths in it stay relative to cwd (= project_root).
-
-    We append `--db-path=<abs>` to each server's args so the DuckDB location
-    is explicit at spawn time instead of being baked into the MCP script.
-    """
+    """Parse the skill-local .mcp.json and append --db-path to each server's args."""
     mcp_json = project_root / SKILL_MCP_JSON
     raw = json.loads(mcp_json.read_text())
     servers = raw.get("mcpServers") or {}
     if not servers:
         raise ValueError(f"No mcpServers defined in {mcp_json}")
 
-    db_arg = f"--db-path={db_path}"
     for spec in servers.values():
         args = list(spec.get("args") or [])
-        args.append(db_arg)
+        args.append(f"--db-path={db_path}")
         spec["args"] = args
     return servers
 
 
-def _precheck(config: TradingDailyConfig) -> None:
-    """Fail fast with clear messages before spending any API cost."""
+def _precheck(config: ReportGenerationDailyConfig) -> None:
     root = config.project_root
 
     skill = root / SKILL_DIR / "SKILL.md"
     if not skill.is_file():
-        raise FileNotFoundError(
-            f"Trading SKILL.md not found at {skill}."
-        )
+        raise FileNotFoundError(f"Report generation SKILL.md not found at {skill}.")
 
     mcp_json = root / SKILL_MCP_JSON
     if not mcp_json.is_file():
-        raise FileNotFoundError(
-            f".mcp.json not found at {mcp_json}."
-        )
+        raise FileNotFoundError(f".mcp.json not found at {mcp_json}.")
 
     _check_mcp_server_importable(root)
 
@@ -246,7 +219,6 @@ def _precheck(config: TradingDailyConfig) -> None:
         )
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    # Touch-test writability so we fail before burning API cost.
     probe = config.output_dir / ".writable_probe"
     try:
         probe.touch()
@@ -258,25 +230,17 @@ def _precheck(config: TradingDailyConfig) -> None:
 
 
 def _check_mcp_server_importable(project_root: Path) -> None:
-    """Verify the MCP server script can import all deps before the SDK spawns it.
-
-    Claude CLI swallows MCP startup errors silently — if fastmcp / duckdb /
-    pandas_ta are missing, the agent sees zero tools and falls back to arbitrary
-    Bash (incl. reading the DuckDB directly), which defeats the skill's contract.
-    We catch that here so the user gets a clear `pip install` hint instead of
-    a mysteriously empty tool set.
-    """
     import subprocess
     import sys
 
     script = project_root / SKILL_MCP_SCRIPT
     if not script.is_file():
-        raise FileNotFoundError(
-            f"MCP server script not found at {script}."
-        )
+        raise FileNotFoundError(f"MCP server script not found at {script}.")
 
-    # Escape hatch for tests / CI where the deps aren't installed
-    if os.environ.get("TRADING_MCP_SKIP_PROBE") == "1":
+    if (
+        os.environ.get("REPORT_GENERATION_MCP_SKIP_PROBE") == "1"
+        or os.environ.get("TRADING_MCP_SKIP_PROBE") == "1"
+    ):
         return
 
     probe = (
@@ -306,15 +270,10 @@ def _check_mcp_server_importable(project_root: Path) -> None:
 
 
 def _find_output_file(output_dir: Path, symbol: str) -> Path | None:
-    """Return the latest `trading_{SYMBOL}_*.json` the agent wrote in output_dir.
-
-    The skill writes directly via `upsert_decision.py --output-root=<dir>`;
-    this just picks the freshest matching file so callers can report where
-    the result landed. Returns None if the agent didn't produce one.
-    """
+    """Return the latest `*_report_generation_{SYMBOL}_*.json` the agent wrote."""
     if not output_dir.is_dir():
         return None
-    candidates = list(output_dir.glob(f"trading_{symbol}_*.json"))
+    candidates = list(output_dir.glob(f"*_report_generation_{symbol}_*.json"))
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)

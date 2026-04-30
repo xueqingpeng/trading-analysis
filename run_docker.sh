@@ -23,8 +23,9 @@
 #       --output  ./results/trading
 #
 #   ./run_docker.sh report-generation \
-#       --benchmark-root ./financial_agentic_benchmark \
-#       --ticker TSLA --output-root ./results/reports \
+#       --symbol TSLA --start 2025-03-03 --end 2025-03-31 \
+#       --db-path ./data/trading.duckdb \
+#       --output  ./results/report_generation \
 #       --model gpt-4.1
 #
 #   ./run_docker.sh --build -- --help

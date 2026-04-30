@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -36,6 +37,7 @@ class BenchmarkTask:
     permission_mode: str = "bypassPermissions"
     setting_sources: list[str] | None = None
     data_root: str | None = None
+    db_path: str | None = None
     output_root: str | None = None
     reports_root: str | None = None
     ticker: str | None = None
@@ -108,47 +110,9 @@ def run_benchmark_task(
     """
     benchmark_root = _resolve_benchmark_root(task.benchmark_root)
     project_root = DEFAULT_PROJECT_ROOT.resolve()
-
-    # Skills with dedicated runners (auditing) take over the full lifecycle
-    # so batch JSONL and the dedicated CLI subcommand share one code path.
-    if _normalize_task_type(task.task_type) == "auditing":
-        from .auditing_runner import AuditingConfig, run_auditing
-        filing_name = _required_value(task.filing_name, "filing_name").lower()
-        if filing_name not in {"10k", "10q"}:
-            raise ValueError("filing_name must be either '10k' or '10q'")
-        ticker = _required_value(task.ticker, "ticker").lower()
-        issue_time = _required_value(task.issue_time, "issue_time")
-        if len(issue_time) != 8 or not issue_time.isdigit():
-            raise ValueError("issue_time must be an 8-digit YYYYMMDD string")
-        config = AuditingConfig(
-            filing_name=filing_name,
-            ticker=ticker,
-            issue_time=issue_time,
-            concept_id=_required_value(task.concept_id, "concept_id"),
-            period=_required_value(task.period, "period"),
-            case_id=_required_value(task.case_id, "case_id"),
-            benchmark_root=benchmark_root,
-            data_root=Path(task.data_root).expanduser().resolve() if task.data_root else None,
-            output_root=Path(task.output_root).expanduser().resolve() if task.output_root else None,
-            project_root=project_root,
-            model=task.model,
-            max_turns=task.max_turns or 30,
-            max_budget_usd=task.max_budget_usd or 5.0,
-        )
-        audit_result = run_auditing(
-            config,
-            on_assistant_text=on_assistant_text,
-            on_thinking=on_thinking,
-            on_tool_use=on_tool_use,
-            on_stderr=on_stderr,
-        )
-        return BenchmarkRunResult(
-            task=task,
-            prompt=audit_result.prompt,
-            agent_result=audit_result.agent_result,
-        )
-
     prompt = _build_prompt(task, benchmark_root)
+    mcp_servers = _load_task_mcp_servers(task, project_root, benchmark_root)
+
     agent_result = run_agent(
         prompt=prompt,
         cwd=str(project_root),
@@ -157,6 +121,7 @@ def run_benchmark_task(
         max_budget_usd=task.max_budget_usd or 5.0,
         permission_mode=task.permission_mode,
         setting_sources=task.setting_sources or ["project"],
+        mcp_servers=mcp_servers,
         on_assistant_text=on_assistant_text,
         on_thinking=on_thinking,
         on_tool_use=on_tool_use,
@@ -255,21 +220,22 @@ def _build_prompt(task: BenchmarkTask, benchmark_root: Path) -> str:
 
     if task_type == "report_generation":
         ticker = _validate_trading_ticker(task.ticker)
-        data_root = _resolve_path(task.data_root, benchmark_root / "data" / "trading")
         output_root = _resolve_output_dir(
             task.output_root,
             benchmark_root / "results" / "report_generation",
         )
+        model = task.model or "claude-code"
         return (
-            f"Please generate weekly equity reports for {ticker}. "
-            f"The input data is at {data_root}, please save the output to {output_root}."
+            f"you are {model}. "
+            f"Generate equity research report for {ticker}. "
+            f"When calling upsert_report.py, pass --output-root={Path(output_root).as_posix()}."
         )
 
     if task_type == "report_evaluation":
         ticker = _validate_trading_ticker(task.ticker)
         target_agent = _required_value(task.target_agent, "target_agent")
         target_model = _required_value(task.target_model, "target_model")
-        data_root = _resolve_path(task.data_root, benchmark_root / "data" / "trading")
+        db_path = _required_path(task.db_path, "db_path")
         reports_root = _resolve_path(
             task.reports_root,
             benchmark_root / "results" / "report_generation",
@@ -281,13 +247,31 @@ def _build_prompt(task: BenchmarkTask, benchmark_root: Path) -> str:
         return (
             f"Evaluate the {target_agent}/{ticker}/{target_model} run. "
             f"Reports parent: {reports_root}. "
-            f"Data: {data_root}. "
+            f"DuckDB: {db_path}. "
             f"Output: {output_root}."
         )
 
-    # auditing is handled directly by run_auditing in run_benchmark_task —
-    # _build_prompt only handles task types that share the generic agent
-    # invocation path (no skill-specific MCP injection).
+    if task_type == "auditing":
+        filing_name = _required_value(task.filing_name, "filing_name").lower()
+        if filing_name not in {"10k", "10q"}:
+            raise ValueError("filing_name must be either '10k' or '10q'")
+        ticker = _required_value(task.ticker, "ticker").lower()
+        issue_time = _required_value(task.issue_time, "issue_time")
+        if len(issue_time) != 8 or not issue_time.isdigit():
+            raise ValueError("issue_time must be an 8-digit YYYYMMDD string")
+        concept_id = _required_value(task.concept_id, "concept_id")
+        period = _required_value(task.period, "period")
+        case_id = _required_value(task.case_id, "case_id")
+        data_root = _resolve_path(task.data_root, benchmark_root / "data" / "auditing")
+        output_root = _resolve_output_dir(task.output_root, benchmark_root / "results" / "auditing")
+        issue_date = datetime.strptime(issue_time, "%Y%m%d").strftime("%Y-%m-%d")
+        return (
+            f"Please audit the value of {concept_id} for {period} in the {filing_name} filing "
+            f"released by {ticker} on {issue_date}. What's the reported value? What's the actual "
+            f"value calculated from the relevant linkbases and US-GAAP taxonomy? (id: {case_id}) "
+            f"The input data is at {data_root}, please save the output to {output_root}."
+        )
+
     raise ValueError(
         f"Unsupported task_type '{task.task_type}'. "
         f"Expected one of: trading, report_generation, report_evaluation, auditing"
@@ -320,3 +304,44 @@ def _resolve_output_dir(value: str | None, default: Path) -> str:
     path = Path(value).expanduser().resolve() if value else default.resolve()
     path.mkdir(parents=True, exist_ok=True)
     return str(path)
+
+
+REPORT_EVALUATION_SKILL_DIR = Path(".claude") / "skills" / "report_evaluation"
+REPORT_EVALUATION_MCP_JSON = REPORT_EVALUATION_SKILL_DIR / ".mcp.json"
+
+
+def _required_path(value: str | None, field_name: str) -> str:
+    if not value:
+        raise ValueError(f"{field_name} is required")
+    path = Path(value).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Path does not exist: {path}")
+    return str(path)
+
+
+def _load_task_mcp_servers(
+    task: BenchmarkTask, project_root: Path, benchmark_root: Path
+) -> dict | None:
+    task_type = _normalize_task_type(task.task_type)
+    if task_type != "report_evaluation":
+        return None
+
+    db_path = Path(_required_path(task.db_path, "db_path"))
+    reports_root = Path(
+        _resolve_path(task.reports_root, benchmark_root / "results" / "report_generation")
+    )
+    mcp_json = project_root / REPORT_EVALUATION_MCP_JSON
+    if not mcp_json.is_file():
+        raise FileNotFoundError(f".mcp.json not found at {mcp_json}.")
+
+    raw = json.loads(mcp_json.read_text())
+    servers = raw.get("mcpServers") or {}
+    if not servers:
+        raise ValueError(f"No mcpServers defined in {mcp_json}")
+
+    for spec in servers.values():
+        args = list(spec.get("args") or [])
+        args.append(f"--db-path={db_path}")
+        args.append(f"--reports-root={reports_root}")
+        spec["args"] = args
+    return servers

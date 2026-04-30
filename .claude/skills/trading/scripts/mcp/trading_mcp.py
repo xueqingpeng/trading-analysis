@@ -39,6 +39,12 @@ def _get_db_path() -> str:
     env = os.environ.get("TRADING_DB_PATH")
     if env:
         return env
+
+    project_root = Path(__file__).resolve().parent.parent.parent.parent.parent.parent
+    default_db = project_root / "env.duckdb"
+    if default_db.exists():
+        return str(default_db)
+
     raise RuntimeError(
         "trading_mcp: DuckDB path not configured. Pass --db-path=<path> on the "
         "command line or set TRADING_DB_PATH."

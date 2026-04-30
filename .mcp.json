@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "report_generation_mcp": {
+      "command": "D:\\pictureforfinnlp\\.venv\\trading-analysis-claude-agent-sdk\\Scripts\\python.exe",
+      "args": [
+        "D:\\trading-analysis-claude-agent-sdk\\.claude\\skills\\report_generation\\scripts\\mcp\\report_generation_mcp.py",
+        "--db-path",
+        "D:\\trading-analysis-claude-agent-sdk\\env.duckdb"
+      ]
+    }
+  }
+}

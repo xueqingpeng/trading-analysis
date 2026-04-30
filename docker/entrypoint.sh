@@ -33,19 +33,7 @@ if need_proxy; then
             >"${PROXY_LOG}" 2>&1 &
     fi
     PROXY_PID=$!
-    # On exit, kill proxy AND copy its log to the first writable mounted
-    # output dir so the user can inspect what the proxy actually did/saw
-    # (the container's /tmp is gone the moment we return).
-    save_proxy_log() {
-        kill "${PROXY_PID}" 2>/dev/null || true
-        for d in /io/slot*; do
-            if [[ -d "$d" && -w "$d" && -f "${PROXY_LOG}" ]]; then
-                cp "${PROXY_LOG}" "$d/proxy_$(date -u +%Y%m%dT%H%M%SZ).log" 2>/dev/null || true
-                break
-            fi
-        done
-    }
-    trap save_proxy_log EXIT INT TERM
+    trap 'kill "${PROXY_PID}" 2>/dev/null || true' EXIT INT TERM
 
     # Silently wait for uvicorn to bind the port (~15s cap). Once the socket
     # accepts connections, FastAPI is ready — no HTTP probe needed.
