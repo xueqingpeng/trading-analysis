@@ -14,26 +14,6 @@ Critical design note — NO as_of_date guard on this server:
   past report_date. The skill prompt enforces "use only <= report_date for
   per-report scoring; use forward data only for backtest aggregation"; the
   MCP layer leaves all data accessible.
-
-Tool inventory (14 tools):
-
-Market / news / filings (kept from existing implementation):
-  - get_prices, list_news, get_news_by_id, list_filings, get_filing_section,
-    get_indicator
-
-Report file access (kept from existing implementation):
-  - list_reports, get_report_content
-
-Generation mirrors (NEW — let evaluator see what generator saw):
-  - verify_weekly_metrics       ground truth for the 17 metrics
-  - get_news_digest_mirror      what generator likely saw as news context
-  - get_filing_highlights_mirror what generator likely saw as filing context
-
-Evaluation-specific helpers (NEW):
-  - get_report_metrics          structured extraction of rating + 17 metrics
-  - get_forward_returns         backtest signal: did the rating play out?
-  - check_news_leakage          per-id leak check
-  - search_news_titles          keyword search for evidence verification
 """
 
 from __future__ import annotations
@@ -72,6 +52,22 @@ RATING_TO_NUMERIC: dict[str, int] = {
     "HOLD": 0,
     "BUY": 1,
     "STRONG_BUY": 2,
+}
+
+# Must stay aligned with report_generation_mcp.PEER_MAP. The evaluator uses
+# this to recompute the same beta / relative-performance block that the
+# generator saw at report time.
+PEER_MAP: dict[str, dict] = {
+    "AAPL":  {"sector": "Mega-Cap Tech",   "peers": ["MSFT", "GOOGL", "META"]},
+    "ADBE":  {"sector": "Software / SaaS", "peers": ["MSFT"]},
+    "AMZN":  {"sector": "Mega-Cap Tech",   "peers": ["GOOGL", "META", "MSFT"]},
+    "BMRN":  {"sector": "Biotech",         "peers": []},
+    "CRM":   {"sector": "Software / SaaS", "peers": ["ADBE", "MSFT"]},
+    "GOOGL": {"sector": "Mega-Cap Tech",   "peers": ["META", "AMZN", "MSFT"]},
+    "META":  {"sector": "Mega-Cap Tech",   "peers": ["GOOGL", "AMZN"]},
+    "MSFT":  {"sector": "Mega-Cap Tech",   "peers": ["GOOGL", "AMZN", "AAPL"]},
+    "NVDA":  {"sector": "Mega-Cap Tech / Semiconductors", "peers": ["MSFT", "GOOGL", "META", "AMZN", "AAPL"]},
+    "TSLA":  {"sector": "Mega-Cap Tech / EV", "peers": ["AAPL", "AMZN", "META", "GOOGL", "MSFT", "NVDA"]},
 }
 
 mcp = FastMCP("report_evaluation_mcp")
@@ -114,6 +110,134 @@ def _connect() -> duckdb.DuckDBPyConnection:
     return duckdb.connect(_get_db_path(), read_only=True)
 
 
+def _fetch_adj_close_series(symbol: str, date_start: str, date_end: str) -> pd.Series:
+    """Return an adj_close Series indexed by date string, matching generation MCP."""
+    sql = (
+        "SELECT CAST(date AS VARCHAR) AS date, adj_close "
+        "FROM prices WHERE symbol = ? AND date >= ? AND date <= ? ORDER BY date ASC"
+    )
+    with _connect() as conn:
+        rows = conn.execute(sql, [symbol, date_start, date_end]).fetchall()
+    if not rows:
+        return pd.Series(dtype=float)
+    return pd.Series(
+        data=[float(r[1]) for r in rows],
+        index=[str(r[0]) for r in rows],
+        dtype=float,
+        name=symbol,
+    )
+
+
+def _compute_beta_block(
+    symbol: str,
+    peers: list[str],
+    target_date: str,
+    week_start_dt: pd.Timestamp,
+    end_dt: pd.Timestamp,
+) -> dict:
+    """Mirror report_generation_mcp._compute_beta_block exactly."""
+    null_result = {
+        "sector_basket_return_1w_pct": None,
+        "relative_return_1w_pct": None,
+        "relative_return_4w_pct": None,
+        "correlation_60d": None,
+        "beta_60d": None,
+        "benchmark_basket": [],
+    }
+    if not peers:
+        return null_result
+
+    fetch_start = (date.fromisoformat(target_date) - timedelta(days=100)).isoformat()
+    sym_series = _fetch_adj_close_series(symbol, fetch_start, target_date)
+    if sym_series.empty:
+        return null_result
+
+    peer_series_list = []
+    valid_peers = []
+    for peer in peers:
+        ps = _fetch_adj_close_series(peer, fetch_start, target_date)
+        if not ps.empty:
+            peer_series_list.append(ps)
+            valid_peers.append(peer)
+    if not peer_series_list:
+        return {**null_result, "benchmark_basket": []}
+
+    peer_df = pd.concat(peer_series_list, axis=1, keys=valid_peers).dropna()
+    peer_df_norm = peer_df / peer_df.iloc[0]
+    basket_price = peer_df_norm.mean(axis=1)
+
+    sym_aligned = sym_series.reindex(basket_price.index).dropna()
+    basket_aligned = basket_price.reindex(sym_aligned.index)
+    if len(sym_aligned) < 5:
+        return {**null_result, "benchmark_basket": valid_peers}
+
+    week_start_str = week_start_dt.strftime("%Y-%m-%d")
+    end_str = end_dt.strftime("%Y-%m-%d")
+
+    basket_week = basket_aligned[(basket_aligned.index >= week_start_str) & (basket_aligned.index <= end_str)]
+    basket_pre_week = basket_aligned[basket_aligned.index < week_start_str]
+    sector_basket_return_1w_pct = None
+    if len(basket_week) > 0 and len(basket_pre_week) > 0:
+        basket_prev_close = float(basket_pre_week.iloc[-1])
+        basket_week_close = float(basket_week.iloc[-1])
+        if basket_prev_close != 0:
+            sector_basket_return_1w_pct = round((basket_week_close - basket_prev_close) / basket_prev_close * 100, 2)
+
+    sym_week = sym_aligned[(sym_aligned.index >= week_start_str) & (sym_aligned.index <= end_str)]
+    sym_pre_week = sym_aligned[sym_aligned.index < week_start_str]
+    sym_weekly_return_pct = None
+    if len(sym_week) > 0 and len(sym_pre_week) > 0:
+        sym_prev_close = float(sym_pre_week.iloc[-1])
+        sym_week_close = float(sym_week.iloc[-1])
+        if sym_prev_close != 0:
+            sym_weekly_return_pct = round((sym_week_close - sym_prev_close) / sym_prev_close * 100, 2)
+
+    relative_return_1w_pct = None
+    if sym_weekly_return_pct is not None and sector_basket_return_1w_pct is not None:
+        relative_return_1w_pct = round(sym_weekly_return_pct - sector_basket_return_1w_pct, 2)
+
+    relative_return_4w_pct = None
+    if len(sym_aligned) >= 21 and len(basket_aligned) >= 21:
+        sym_idx = list(sym_aligned.index)
+        basket_idx = list(basket_aligned.index)
+        common_idx = [d for d in sym_idx if d in set(basket_idx)]
+        if len(common_idx) >= 21:
+            base_date = common_idx[-21]
+            sym_4w_base = float(sym_aligned[base_date])
+            basket_4w_base = float(basket_aligned[base_date])
+            sym_4w_close = float(sym_aligned.iloc[-1])
+            basket_4w_close = float(basket_aligned.iloc[-1])
+            if sym_4w_base != 0 and basket_4w_base != 0:
+                sym_4w_ret = (sym_4w_close - sym_4w_base) / sym_4w_base * 100
+                basket_4w_ret = (basket_4w_close - basket_4w_base) / basket_4w_base * 100
+                relative_return_4w_pct = round(sym_4w_ret - basket_4w_ret, 2)
+
+    correlation_60d = None
+    beta_60d = None
+    sym_ret = sym_aligned.pct_change().dropna()
+    basket_ret = basket_aligned.pct_change().dropna()
+    common_ret_idx = sym_ret.index.intersection(basket_ret.index)
+    if len(common_ret_idx) >= 20:
+        last_60 = common_ret_idx[-60:] if len(common_ret_idx) >= 60 else common_ret_idx
+        s = sym_ret.loc[last_60].astype(float)
+        b = basket_ret.loc[last_60].astype(float)
+        if len(s) >= 10 and b.std() > 0:
+            correlation_60d = round(float(s.corr(b)), 4)
+            cov = float(s.cov(b))
+            var_b = float(b.var())
+            if var_b > 0:
+                beta_60d = round(cov / var_b, 4)
+
+    return {
+        "sector_basket_return_1w_pct": sector_basket_return_1w_pct,
+        "relative_return_1w_pct": relative_return_1w_pct,
+        "relative_return_4w_pct": relative_return_4w_pct,
+        "correlation_60d": correlation_60d,
+        "beta_60d": beta_60d,
+        "benchmark_basket": valid_peers,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Market / news / filings tools — same as before. NO as_of_date guard:
 # evaluation must be able to read data past report_date in order to compute
@@ -150,9 +274,9 @@ def get_prices(
 
 @mcp.tool(
     description=(
-        "Return compact news metadata for a symbol in [date_start, date_end] inclusive: "
-        "{symbol, date, id, title, url}. Use this to verify whether report claims are "
-        "grounded in available news."
+        "Return compact news metadata for a symbol in [date_start, date_end] inclusive. "
+        "This dataset stores news text in highlights; the tool returns title=highlights "
+        "and url=None for schema compatibility."
     )
 )
 def list_news(
@@ -161,7 +285,7 @@ def list_news(
     date_end: Annotated[str, Field(description="Inclusive end date YYYY-MM-DD")],
 ) -> list[dict]:
     sql = (
-        "SELECT symbol, CAST(DATE(date) AS VARCHAR) AS date, id, title, url "
+        "SELECT symbol, CAST(DATE(date) AS VARCHAR) AS date, id, highlights AS title, NULL AS url "
         "FROM news WHERE symbol = ? AND DATE(date) >= ? AND DATE(date) <= ? "
         "ORDER BY date ASC, id ASC"
     )
@@ -174,14 +298,14 @@ def list_news(
 
 
 @mcp.tool(
-    description="Fetch one news article in full by id: {symbol, date, id, title, url, highlights}."
+    description="Fetch one news article by id: {symbol, date, id, title, url, highlights}; title mirrors highlights and url is None in this dataset."
 )
 def get_news_by_id(
     symbol: Annotated[str, Field(description="Stock symbol")],
     id: Annotated[int, Field(description="News id returned by list_news")],
 ) -> Optional[dict]:
     sql = (
-        "SELECT symbol, CAST(DATE(date) AS VARCHAR) AS date, id, title, url, highlights "
+        "SELECT symbol, CAST(DATE(date) AS VARCHAR) AS date, id, highlights AS title, NULL AS url, highlights "
         "FROM news WHERE symbol = ? AND id = ?"
     )
     with _connect() as conn:
@@ -426,44 +550,45 @@ def get_report_content(
     }
 
 
-# Mapping from human-readable label in the markdown table to the canonical
-# metric key used by report_generation. Aligned with the WEEKLY skill output
-# format. Used by get_report_metrics.
+# Mapping from human-readable labels in the generated Markdown table to the
+# canonical keys returned by report_generation_mcp.get_weekly_metrics.
+# This intentionally matches the latest report_generation SKILL table: 16
+# required alpha/momentum/beta metrics plus four context rows used in prose.
 _METRIC_LABEL_TO_KEY: dict[str, str] = {
-    # Price
     "week open": "week_open",
     "week close": "week_close",
-    "week high": "week_high",
-    "week low": "week_low",
-    # Returns
     "weekly return": "weekly_return_pct",
     "4-week return": "return_4week_pct",
-    # MA
-    "5-day ma": "ma_5day",
     "20-day ma": "ma_20day",
-    "60-day ma": "ma_60day",
     "price vs 20-day ma": "price_vs_ma20",
-    # Volume & Fund Flow
-    "volume ratio (vs 20d avg)": "volume_ratio",
-    "chaikin money flow (20d)": "cmf_20day",
-    # Support / Resistance
+    "weekly volatility": "weekly_volatility",
+    "distance from 52-week high": "dist_from_52w_high_pct",
     "20-day support": "support_20d",
     "20-day resistance": "resistance_20d",
-    # Risk
-    "weekly volatility": "weekly_volatility",
-    # Momentum
     "short-term momentum": "momentum_short",
     "macd signal": "macd_signal",
     "rsi (14)": "rsi_14",
-    # Position
-    "distance from 52-week high": "dist_from_52w_high_pct",
-    "distance from 52-week low": "dist_from_52w_low_pct",
+    "volume ratio (vs 20d avg)": "volume_ratio",
+    "chaikin money flow (20d)": "cmf_20day",
+    "sector basket return (1w)": "sector_basket_return_1w_pct",
+    "relative return (1w)": "relative_return_1w_pct",
+    "relative return (4w)": "relative_return_4w_pct",
+    "correlation (60d)": "correlation_60d",
+    "beta (60d)": "beta_60d",
 }
 
+# The 16 metrics required by the generation skill. Context rows are parsed too,
+# but missing context rows should not fail quantitative alignment.
+_REQUIRED_METRIC_KEYS: tuple[str, ...] = (
+    "week_open", "week_close", "weekly_return_pct", "return_4week_pct",
+    "ma_20day", "price_vs_ma20", "weekly_volatility",
+    "dist_from_52w_high_pct", "momentum_short", "macd_signal", "rsi_14",
+    "sector_basket_return_1w_pct", "relative_return_1w_pct",
+    "relative_return_4w_pct", "correlation_60d", "beta_60d",
+)
+
 # Categorical metrics keep their string form (lowercased).
-_CATEGORICAL_METRIC_KEYS = {
-    "price_vs_ma20", "momentum_short", "macd_signal",
-}
+_CATEGORICAL_METRIC_KEYS = {"price_vs_ma20", "momentum_short", "macd_signal"}
 
 _RATING_PATTERN = re.compile(r"\b(STRONG_BUY|STRONG_SELL|BUY|SELL|HOLD)\b")
 
@@ -473,7 +598,16 @@ def _parse_metric_value(key: str, raw: str) -> object:
     raw = raw.strip()
     if key in _CATEGORICAL_METRIC_KEYS:
         return raw.lower() if raw else None
-    if not raw or raw == "-" or raw.lower() == "n/a":
+    raw_lower = raw.lower()
+    if (
+        not raw
+        or raw == "-"
+        or raw_lower == "n/a"
+        or raw_lower.startswith("n/a ")
+        or raw_lower.startswith("n/a(")
+        or raw_lower.startswith("n/a (")
+        or "no peers" in raw_lower
+    ):
         return None
     # rsi_14 sometimes appears as "50.8 (neutral)" — keep just the number,
     # the rsi_class is parsed separately if needed.
@@ -495,15 +629,11 @@ def _parse_metric_value(key: str, raw: str) -> object:
 @mcp.tool(
     description=(
         "Parse the structured fields out of a generated WEEKLY report markdown "
-        "file: rating + the 17 metrics from the 'Weekly Price Performance' "
+        "file: rating + the latest weekly metrics from the 'Weekly Price Performance' "
         "table. Returns {relative_path, filename, report_date, rating, "
         "rating_numeric, metrics, parse_warnings}.\n\n"
-        "metric keys are aligned with the canonical names returned by "
-        "report_generation_mcp.get_weekly_metrics: week_open, week_close, "
-        "week_high, week_low, weekly_return_pct, return_4week_pct, ma_5day, "
-        "ma_20day, ma_60day, price_vs_ma20, weekly_volatility, "
-        "momentum_short, macd_signal, rsi_14, volume_ratio, "
-        "dist_from_52w_high_pct, dist_from_52w_low_pct.\n\n"
+        "metric keys are aligned with report_generation_mcp.get_weekly_metrics, "
+        "including alpha, momentum/volume, support/resistance, and beta rows.\n\n"
         "Use this INSTEAD of having the agent regex-parse markdown by hand."
     )
 )
@@ -554,9 +684,15 @@ def get_report_metrics(
             continue
         metrics[key] = _parse_metric_value(key, raw_value)
 
-    missing = [k for k in _METRIC_LABEL_TO_KEY.values() if k not in metrics]
-    if missing:
-        warnings.append(f"missing metrics in table: {missing}")
+    missing_required = [k for k in _REQUIRED_METRIC_KEYS if k not in metrics]
+    missing_context = [
+        k for k in _METRIC_LABEL_TO_KEY.values()
+        if k not in metrics and k not in _REQUIRED_METRIC_KEYS
+    ]
+    if missing_required:
+        warnings.append(f"missing required metrics in table: {missing_required}")
+    if missing_context:
+        warnings.append(f"missing context metrics in table: {missing_context}")
 
     # --- report_date from filename -----------------------------------------
     report_date = None
@@ -607,15 +743,12 @@ def _classify_rsi(rsi_value: float) -> str:
 
 @mcp.tool(
     description=(
-        "Recompute the canonical 17 weekly metrics for (symbol, report_date) "
+        "Recompute the canonical weekly metrics for (symbol, report_date) "
         "using the SAME logic as report_generation_mcp.get_weekly_metrics. "
         "This is the GROUND TRUTH used to score quantitative_alignment.\n\n"
-        "Returned keys match get_weekly_metrics: week_open, week_close, "
-        "week_high, week_low, weekly_return_pct, return_4week_pct, ma_5day, "
-        "ma_20day, ma_60day, price_vs_ma20, weekly_volatility, "
-        "momentum_short, macd_signal, rsi_14, volume_ratio, "
-        "dist_from_52w_high_pct, dist_from_52w_low_pct, plus extras "
-        "macd_values, rsi_class, week_trading_days.\n\n"
+        "Returned keys match get_weekly_metrics, including the 16 required "
+        "alpha/momentum/beta metrics plus support/resistance, CMF, volume, "
+        "raw MACD values, RSI class, week_trading_days, and benchmark_basket.\n\n"
         "If report_date is not a trading day, raises ValueError; the "
         "evaluator should treat that report as not scorable on quantitative "
         "alignment."
@@ -686,6 +819,20 @@ def verify_weekly_metrics(
         ("above" if week_close > ma_20day else "below") if ma_20day is not None else None
     )
 
+    # Support / resistance and fund-flow context
+    last_20 = df.tail(20)
+    support_20d = round(float(last_20["low"].min()), 4) if len(last_20) >= 1 else None
+    resistance_20d = round(float(last_20["high"].max()), 4) if len(last_20) >= 1 else None
+
+    cmf_20day = None
+    if len(last_20) >= 1:
+        hl_range = (last_20["high"] - last_20["low"]).replace(0, float("nan"))
+        mfm = ((last_20["close"] - last_20["low"]) - (last_20["high"] - last_20["close"])) / hl_range
+        mfv = mfm * last_20["volume"]
+        total_vol = last_20["volume"].sum()
+        if total_vol > 0:
+            cmf_20day = round(float(mfv.sum() / total_vol), 4)
+
     # Risk block
     this_week_returns = this_week["adj_close"].pct_change().dropna()
     if len(this_week_returns) >= 2:
@@ -749,6 +896,16 @@ def verify_weekly_metrics(
     dist_from_52w_high_pct = round((week_close - high_52w) / high_52w * 100, 2)
     dist_from_52w_low_pct = round((week_close - low_52w) / low_52w * 100, 2)
 
+    # Beta / relative-performance block
+    peers = PEER_MAP.get(symbol, {}).get("peers", [])
+    beta_block = _compute_beta_block(
+        symbol=symbol,
+        peers=peers,
+        target_date=report_date,
+        week_start_dt=week_start_dt,
+        end_dt=end_dt,
+    )
+
     return {
         "week_open": week_open,
         "week_close": week_close,
@@ -765,8 +922,17 @@ def verify_weekly_metrics(
         "macd_signal": macd_signal,
         "rsi_14": rsi_14,
         "volume_ratio": volume_ratio,
+        "cmf_20day": cmf_20day,
+        "support_20d": support_20d,
+        "resistance_20d": resistance_20d,
         "dist_from_52w_high_pct": dist_from_52w_high_pct,
         "dist_from_52w_low_pct": dist_from_52w_low_pct,
+        "sector_basket_return_1w_pct": beta_block["sector_basket_return_1w_pct"],
+        "relative_return_1w_pct": beta_block["relative_return_1w_pct"],
+        "relative_return_4w_pct": beta_block["relative_return_4w_pct"],
+        "correlation_60d": beta_block["correlation_60d"],
+        "beta_60d": beta_block["beta_60d"],
+        "benchmark_basket": beta_block["benchmark_basket"],
         "macd_values": macd_values,
         "rsi_class": rsi_class,
         "week_trading_days": int(len(this_week)),
@@ -789,7 +955,7 @@ def get_news_digest_mirror(
 ) -> list[dict]:
     start = (date.fromisoformat(target_date) - timedelta(days=lookback_days)).isoformat()
     sql = (
-        "SELECT id, symbol, CAST(DATE(date) AS VARCHAR) AS date, title, url, highlights "
+        "SELECT id, symbol, CAST(DATE(date) AS VARCHAR) AS date, highlights AS title, NULL AS url, highlights "
         "FROM news WHERE symbol = ? AND DATE(date) >= ? AND DATE(date) <= ? "
         "ORDER BY date DESC LIMIT ?"
     )
@@ -972,10 +1138,10 @@ def check_news_leakage(
 
 @mcp.tool(
     description=(
-        "Search news titles for a symbol in a window for keyword matches. "
+        "Search news highlights for a symbol in a window for keyword matches. "
         "Useful for evidence_fidelity: did the report mention an event that "
         "actually appeared in the news? Returns matching {id, date, title, url} "
-        "rows where the title contains any of the (case-insensitive) keywords."
+        "rows where highlights contains any case-insensitive keyword; title mirrors highlights."
     )
 )
 def search_news_titles(
@@ -987,9 +1153,9 @@ def search_news_titles(
 ) -> list[dict]:
     if not keywords:
         return []
-    where_clauses = " OR ".join(["LOWER(title) LIKE ?"] * len(keywords))
+    where_clauses = " OR ".join(["LOWER(highlights) LIKE ?"] * len(keywords))
     sql = (
-        f"SELECT id, CAST(DATE(date) AS VARCHAR), title, url "
+        f"SELECT id, CAST(DATE(date) AS VARCHAR), highlights AS title, NULL AS url "
         f"FROM news "
         f"WHERE symbol = ? AND DATE(date) >= ? AND DATE(date) <= ? "
         f"AND ({where_clauses}) "
