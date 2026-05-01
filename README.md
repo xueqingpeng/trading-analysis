@@ -461,5 +461,58 @@ trading-analysis/
 ├── build_docker.sh             # Image builder
 ├── .dockerignore
 ├── .env.example
-└── requirements.txt
+├── requirements.txt
+├── openclaw/                   # parallel YAML projection of .claude/skills/
+└── scripts/
+    ├── openclaw_run.py         # minimal openclaw runner (YAML + claude CLI)
+    └── _stream_format.py       # pretty-prints `--output-format stream-json`
 ```
+
+---
+
+## openclaw harness + demo
+
+The five skills under `.claude/skills/` ship with a parallel
+machine-readable projection at `openclaw/`: one YAML per skill spelling
+out routing triggers, MCP server config, tool signatures, output
+artifact templates, and the constraints. The Markdown SKILL.md files
+remain the canonical procedure; each YAML's `procedure_source` points at
+its sibling Markdown.
+
+```
+openclaw/
+├── openclaw.config.example.yaml      # top-level includes
+├── providers/provider.claude.yaml    # Anthropic API + Sonnet 4.6 / Opus 4.7 / Haiku 4.5
+├── routers/router.trading-suite.yaml # priority hedging > report_eval > report_gen > auditing > trading
+└── skills/
+    ├── skill.trading.yaml
+    ├── skill.hedging.yaml
+    ├── skill.auditing.yaml
+    ├── skill.report-generation.yaml
+    └── skill.report-evaluation.yaml
+```
+
+### Demo
+
+`docs/demo-claude.gif` shows one user prompt — `trade AAPL on 2025-05-28`
+— driving the trading skill end to end via Claude Code: spawn
+`trading_mcp`, fetch prices / news / filings / indicators, reason over
+the data, write a single upserted record. ~110 s, ~$0.30 wall cost.
+
+![trade AAPL via Claude Code](docs/demo-claude.gif)
+
+`docs/demo-openclaw.gif` shows the same flow dispatched through
+`scripts/openclaw_run.py`: load `openclaw/skills/skill.trading.yaml`,
+extract model + MCP server config, shell to claude CLI. The openclaw YAML
+is a real spec consumed by a runtime.
+
+```bash
+python3 scripts/openclaw_run.py --symbol AAPL --target-date 2025-05-28
+```
+
+![openclaw_run.py POC](docs/demo-openclaw.gif)
+
+The runner accepts `--skill <path>` to dispatch any of the five YAMLs
+and `--prompt <text>` to override the default trading-style request, so
+hedging / auditing / report skills work too.
+

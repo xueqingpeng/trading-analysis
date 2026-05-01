@@ -1,0 +1,23 @@
+version: 1
+includes:
+  providers:
+    - ./providers/provider.claude.yaml
+  skills:
+    - ./skills/skill.trading.yaml
+    - ./skills/skill.hedging.yaml
+    - ./skills/skill.auditing.yaml
+    - ./skills/skill.report-generation.yaml
+    - ./skills/skill.report-evaluation.yaml
+  routers:
+    - ./routers/router.trading-suite.yaml
+
+model:
+  provider: claude
+  model: claude-sonnet-4-6
+
+notes:
+  - Ensure ANTHROPIC_API_KEY is set for the Claude provider (or use the claude CLI's OAuth/keychain auth).
+  - Each skill that needs market data ships its own MCP server under `.claude/skills/<name>/scripts/mcp/`. trading and hedging share `env.duckdb` at the repo root; auditing reads XBRL files under `data/auditing/`.
+  - Report-generation and report-evaluation are SKILL.md-only (no dedicated MCP server); they use Bash + inline pandas against caller-provided parquet / DuckDB.
+  - Router priorities: hedging (95) > report_evaluation (92) > report_generation (90) > auditing (88) > trading (85). "hedging" wins over bare "trade", "evaluate reports" wins over bare "report".
+  - openclaw is a parallel projection of `.claude/skills/`. The Markdown SKILL.md files in that tree remain the canonical procedure; each YAML's `procedure_source` points back at its sibling SKILL.md.

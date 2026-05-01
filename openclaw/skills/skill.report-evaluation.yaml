@@ -1,0 +1,325 @@
+version: 1
+skill:
+  id: report_evaluation
+  display_name: Weekly Equity Report Evaluation Skill
+  description: >
+    Evaluates a run of weekly equity research reports along five dimensions.
+    (1) Quantitative price-prediction performance via return simulation on
+    adj_close prices fetched from the `trading_mcp` MCP server. (2) Structural
+    completeness and formatting. (3) Content accuracy (symbol, dates,
+    metadata). (4) Evidence fidelity and hallucination detection against MCP
+    prices / news / filings. (5) Reasoning quality. Produces one JSON per
+    agent/symbol/model run.
+  enabled: true
+  procedure_source: ../../.claude/skills/report_evaluation/SKILL.md
+
+routing:
+  auto_invoke: true
+  priority: 86
+  stop_after_match: true
+  positive_triggers:
+    verbs:
+      - evaluate reports
+      - score reports
+      - audit reports
+      - assess reports
+      - measure agent
+      - run report eval
+      - check the reports
+    nouns:
+      - report quality
+      - hallucinations in reports
+      - report evaluation
+      - rubric score
+      - price prediction performance
+    phrasings:
+      - "how good are these reports"
+      - "did the X reports get the direction right"
+      - "check the codex reports"
+      - "run report eval for X"
+  negative_triggers:
+    - generate report
+    - write a report
+    - produce weekly report
+    - trading decision
+    - pair trading
+    - audit filing
+
+model_selection:
+  preferred_provider: claude
+  preferred_model: claude-sonnet-4-6
+  allow_fallback: true
+  large_context_alternative:
+    model: claude-opus-4-7
+    when: "all ~13 reports plus price context must be loaded in one turn"
+  requires_capabilities:
+    - tool_calling
+    - bash
+    - file_io
+
+# Report-evaluation in the claude-agent-sdk branch is SKILL.md-only — no
+# dedicated MCP server. The agent uses Bash + inline pandas to read
+# parquet / DuckDB it has access to (caller-controlled).
+mcp_servers: []
+
+runtime:
+  executor: claude-code-bash
+
+tools:
+  - name: bash_inline_python_pandas
+    purpose: "Read parquet / DuckDB price history via Bash + pandas to recompute expected metrics."
+  - name: parse_markdown_reports
+    purpose: "Parse the run subfolder's .md files via regex to extract per-report ratings + metric tables."
+
+input_artifacts:
+  report_dir_formats:
+    run_subfolder: "results/report_generation/{agent}_report_generation_{SYMBOL}_{model}/"
+    parent_dir: "results/report_generation/"
+  autoresolve_subfolder_rule: >
+    If the user points at the parent directory, scan subfolders matching
+    `{agent}_report_generation_{SYMBOL}_{model}/` and filter by any supplied
+    agent / model values.
+  report_filename_regex: '^(.+)_report_generation_([A-Z]+)_(\d{8})_(.+)\.md$'
+
+input_schema:
+  required:
+    - symbol
+    - report_dir
+  optional:
+    - agent_filter
+    - model_filter
+    - output_dir
+    - eval_start
+    - eval_end
+  defaults:
+    output_dir: results/report_evaluation
+    eval_end: "2025-05-31"
+  symbols_whitelist:
+    - AAPL
+    - ADBE
+    - AMZN
+    - GOOGL
+    - META
+    - MSFT
+    - NVDA
+    - TSLA
+
+context_packing:
+  include_in_order:
+    - skill_procedure
+    - symbol
+    - all_report_markdown_files
+    - mcp_prices_through_last_report_date
+    - mcp_news_across_all_weeks
+    - mcp_filings_up_to_last_report_date
+    - rubric_tables
+  max_context_chars: 200000
+  truncation_policy: keep_all_reports_and_full_price_context_when_possible
+
+output_artifacts:
+  - kind: single_json_per_run
+    path_template: "results/report_evaluation/{agent}_report_evaluation_{SYMBOL}_{model}.json"
+    document_shape:
+      status: completed
+      agent: string
+      symbol: string
+      model: string
+      evaluation_agent: string
+      evaluation_model: string
+      evaluation_date: "YYYY-MM-DD"
+      reports_evaluated: int
+      evaluation_window:
+        start: "YYYY-MM-DD"
+        end: "YYYY-MM-DD"
+      price_performance:
+        long_short:
+          metrics: [total_return_pct, ann_return_pct, ann_vol_pct, sharpe_ratio, max_dd_pct, days_gt_bh_pct, avg_daily_gap_pct]
+        long_only:
+          metrics: [total_return_pct, ann_return_pct, ann_vol_pct, sharpe_ratio, max_dd_pct, days_gt_bh_pct, avg_daily_gap_pct]
+        buy_and_hold:
+          metrics: [total_return_pct, ann_return_pct, ann_vol_pct, sharpe_ratio, max_dd_pct]
+      per_report: "array of per-report entries (see per_report_entry_schema)"
+      aggregate_scores:
+        structure: "mean of per-report structure scores, 2dp"
+        content: "mean of per-report content scores, 2dp"
+        evidence: "mean of per-report evidence scores, 2dp"
+        reasoning: "mean of per-report reasoning scores, 2dp"
+        overall: "mean of the four dimension means, 2dp"
+      run_rubric_summary:
+        per_dimension:
+          - score
+          - systematic_issues
+          - consistent_strengths
+        overall_assessment: "2 to 4 sentence paragraph"
+    per_report_entry_schema:
+      filename: string
+      report_date: "YYYY-MM-DD"
+      week_covered: "YYYY-MM-DD to YYYY-MM-DD"
+      rating: "Strong BUY | BUY | HOLD | SELL | Strong SELL"
+      scores:
+        structure: "integer 0-10"
+        content: "integer 0-10"
+        evidence: "integer 0-10"
+        reasoning: "integer 0-10"
+      notes:
+        structure: string
+        content: string
+        evidence: string
+        reasoning: string
+      metrics_accuracy:
+        checked: int
+        correct: int
+        errors: array
+    rounding_rules:
+      per_report_dimension: "integer 0-10"
+      aggregate_scores: "2 decimal places"
+      price_performance: "4 decimal places"
+    overall_formula: "mean of the four rubric dimension means; price_performance is NOT included in overall"
+
+simulation_config:
+  strategies:
+    - long_short
+    - long_only
+    - buy_and_hold
+  rating_to_action:
+    "Strong BUY": BUY
+    "BUY": BUY
+    "HOLD": HOLD
+    "SELL": SELL
+    "Strong SELL": SELL
+  simulation_mode: aggressive
+  initial_capital: 100000
+  trade_fee: 0.0005
+  annual_trading_days: 252
+  hold_behavior: "HOLD closes existing positions to flat"
+  force_close_on_last_day: true
+  canonical_price_source: adj_close
+
+rubric:
+  structure:
+    max: 10
+    criteria:
+      - { weight: 3, check: "all 8 sections present with headers `### 1.` through `### 8.`" }
+      - { weight: 2, check: "11-row metrics table fully populated" }
+      - { weight: 2, check: "no broken markdown tables or truncated bullet lists" }
+      - { weight: 1, check: "header has Agent, Model, Report Date on line 1" }
+      - { weight: 1, check: "at least 9 `---` horizontal rules between sections" }
+      - { weight: 1, check: "rating emoji present in header" }
+  content:
+    max: 10
+    criteria:
+      - { weight: 1, check: "symbol in report title matches target" }
+      - { weight: 1, check: "report date is a valid Monday (or next trading day) in 2025-03-01 to 2025-05-31" }
+      - { weight: 2, check: "Week Covered is the correct prior Mon to Sun window" }
+      - { weight: 1, check: "rating in header matches Section 2 rating" }
+      - { weight: 2, check: "Section 4 has 3 to 5 news bullets or states 'No news'" }
+      - { weight: 1, check: "Section 5 correctly reflects presence or absence of filings (get_filings empty vs non-empty)" }
+      - { weight: 2, check: "MA Direction in metrics table matches the recomputed sign of (ma_1week - ma_4week)" }
+  evidence:
+    max: 10
+    criteria:
+      - { weight: 5, check: "9 numeric metrics within tolerance max(0.1, 0.005 * |expected|) vs values recomputed from MCP adj_close" }
+      - { weight: 3, check: "Section 4 news bullets traceable to get_news title+highlights for the prior week" }
+      - { weight: 2, check: "Section 5 filings match get_filings mda_content + risk_content, or correctly state 'No filings available'" }
+      - { penalty: "deduct 1 point per clearly invented fact (date, name, or number not traceable to any MCP row for that week). Floor at 0." }
+  reasoning:
+    max: 10
+    criteria:
+      - { weight: 3, check: "rating direction consistent with OHLCV / MA-direction / news evidence shown" }
+      - { weight: 2, check: "Section 2 thesis bullets are distinct and data-backed" }
+      - { weight: 2, check: "Section 7 risks are specific to observed data, not boilerplate" }
+      - { weight: 2, check: "Section 8 outlook names concrete, measurable triggers for a rating change" }
+      - { weight: 1, check: "8 sections tell a consistent, non-contradictory story" }
+
+constraints:
+  no_external_apis:
+    rule: "All prices come from get_prices. Never call yfinance or any network resource."
+  no_look_ahead_on_metrics:
+    rule: "When recomputing expected metrics for a report, use only get_prices rows with date <= report_date."
+  one_output_per_run:
+    rule: "One JSON file per agent/symbol/model combination. Do not combine multiple runs."
+  per_report_required:
+    rule: "All five evaluation dimensions must appear in every per_report entry."
+  run_rubric_summary_nonempty:
+    rule: "systematic_issues and consistent_strengths must be populated with real observations."
+  systematic_issue_threshold:
+    rule: "systematic_issues lists only patterns appearing in at least 2 reports."
+
+behavior_rules:
+  - All prices come from the `trading_mcp` MCP server (adj_close only). No network, no parquet.
+  - Expected metrics are recomputed from get_prices using only dates on or before the report date.
+  - Rubric scores are integers 0 to 10. Aggregate means round to 2 decimals. Price performance rounds to 4 decimals.
+  - The `overall` field is the mean of the four rubric-dimension means; price performance is not mixed in.
+  - per_report is sorted by report_date ascending.
+  - run_rubric_summary.overall_assessment is 2 to 4 sentences naming the strongest systemic issue and the clearest strength.
+  - Do not save intermediate Python scripts to disk.
+
+procedure:
+  - step: 1
+    name: discover_reports
+    description: Parse all `.md` files matching the filename regex in the run subfolder (autoresolve from parent dir if given). Extract agent, model, report_date, week_covered, and rating from each file.
+  - step: 2
+    name: quantitative_simulation
+    description: Fetch adj_close prices via get_prices over the evaluation window. Build daily recommendations by forward-filling each Monday rating across trading days, then run long_short / long_only / buy_and_hold simulations using the aggressive engine and compute the metrics.
+  - step: 3
+    name: structure_eval
+    description: Score each report against the structure rubric.
+  - step: 4
+    name: content_eval
+    description: Score each report against the content rubric (including MA-Direction cross-check against recomputed SMA values).
+  - step: 5
+    name: evidence_eval
+    description: Score each report against the evidence rubric. Recompute 9 numeric metrics from MCP adj_close and compare with tolerance max(0.1, 0.005 * |expected|). Assess news and filing traceability via get_news / get_filings.
+  - step: 6
+    name: reasoning_eval
+    description: Score each report against the reasoning rubric holistically.
+  - step: 7
+    name: compile_and_write
+    description: Aggregate per-report scores, build run_rubric_summary with cross-report patterns, assemble the final JSON, and write to the output path.
+
+prompt_template: |
+  You are the weekly equity report evaluation skill. Evaluate one run of
+  weekly reports (one agent, one symbol, one model) and produce one JSON
+  output.
+
+  Canonical procedure is documented at: {procedure_source}
+
+  Inputs:
+    symbol         = {symbol}
+    report_dir     = {report_dir}
+    agent_filter   = {agent_filter}
+    model_filter   = {model_filter}
+    output_dir     = {output_dir}
+    eval_start     = {eval_start}
+    eval_end       = {eval_end}
+
+  Five evaluation dimensions:
+    1. Quantitative price prediction: long_short, long_only, and buy_and_hold
+       simulations on adj_close prices from get_prices. Compute
+       total_return_pct, ann_return_pct, ann_vol_pct, sharpe_ratio,
+       max_dd_pct, days_gt_bh_pct, avg_daily_gap_pct.
+    2. Structure (0 to 10 per report).
+    3. Content accuracy (0 to 10 per report).
+    4. Evidence fidelity (0 to 10 per report): 9 metrics within tolerance vs
+       recomputed from adj_close; news / filing traceability via MCP;
+       hallucination penalty.
+    5. Reasoning quality (0 to 10 per report).
+
+  Hard rules:
+    - No external APIs. All prices from get_prices.
+    - Never use data after report_date when recomputing expected metrics.
+    - One JSON output per agent/symbol/model run.
+    - Rubric scores are integers 0 to 10. Aggregate means to 2 decimals.
+    - Price performance to 4 decimals.
+    - `overall` is the mean of the four rubric dimension means (no price perf).
+    - run_rubric_summary lists and overall_assessment are populated with real observations.
+    - No intermediate scripts written to disk.
+
+  Output path:
+    results/report_evaluation/{agent}_report_evaluation_{symbol}_{model}.json
+
+output:
+  format: json
+  primary_artifact: "results/report_evaluation/{agent}_report_evaluation_{symbol}_{model}.json"
+  write_strategy: single_write_at_end
+  chat_return: "brief summary of reports evaluated, aggregate scores, and any run-level systematic issues"

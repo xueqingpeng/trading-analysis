@@ -1,0 +1,229 @@
+version: 1
+skill:
+  id: report_generation
+  display_name: Weekly Equity Research Report Generation Skill
+  description: >
+    Generates structured weekly equity research reports for a single symbol
+    every Monday over a 3-month window (2025-03-01 to 2025-05-31) by querying
+    the offline DuckDB through the `trading_mcp` MCP server. Each report
+    covers the prior calendar week, computes 11 required metrics, and issues
+    a graduated Strong BUY / BUY / HOLD / SELL / Strong SELL rating with
+    rationale. Produces ~13 individual Markdown files per run, stored inside
+    a run-specific subfolder.
+  enabled: true
+  procedure_source: ../../.claude/skills/report_generation/SKILL.md
+
+routing:
+  auto_invoke: true
+  priority: 87
+  stop_after_match: true
+  positive_triggers:
+    verbs:
+      - generate equity report
+      - produce weekly report
+      - write research note
+      - produce equity research
+      - write a report
+      - generate weekly reports
+    nouns:
+      - weekly report
+      - equity research report
+      - research note
+      - weekly equity report
+      - Monday report
+    symbols:
+      - AAPL
+      - ADBE
+      - AMZN
+      - GOOGL
+      - META
+      - MSFT
+      - NVDA
+      - TSLA
+  negative_triggers:
+    - trading decision
+    - BUY SELL HOLD single day
+    - pair trading
+    - audit filing
+    - evaluate reports
+    - score reports
+
+model_selection:
+  preferred_provider: claude
+  preferred_model: claude-sonnet-4-6
+  allow_fallback: true
+  requires_capabilities:
+    - tool_calling
+    - bash
+    - file_io
+
+# Report-generation in the claude-agent-sdk branch is SKILL.md-only — no
+# dedicated MCP server. The agent uses Bash + inline pandas to read
+# parquet / DuckDB it has access to (caller-controlled).
+mcp_servers: []
+
+runtime:
+  executor: claude-code-bash
+
+tools:
+  # Pure-bash skill — these are reference patterns the agent may invoke,
+  # not MCP-server tools.
+  - name: bash_inline_python_pandas
+    purpose: "Use Bash to run inline Python with pandas for parquet/DuckDB reads and metric computation."
+  - name: write_markdown_per_monday
+    purpose: "Write one .md per Monday immediately after generating it; do not accumulate."
+
+input_schema:
+  required:
+    - symbol
+  optional:
+    - output_dir
+    - agent_name
+    - model_name
+  symbols_whitelist:
+    - AAPL
+    - ADBE
+    - AMZN
+    - GOOGL
+    - META
+    - MSFT
+    - NVDA
+    - TSLA
+  defaults:
+    output_dir: results/report_generation
+    agent_name: "${OPENCLAW_AGENT_NAME:-claude-code}"
+    model_name: "inherit from model_selection.preferred_model"
+
+context_packing:
+  include_in_order:
+    - skill_procedure
+    - symbol
+    - visible_history_up_to_M
+    - prior_calendar_week_rows
+    - prior_week_news_including_weekends
+    - filings_up_to_M
+    - report_template
+  max_context_chars: 80000
+  truncation_policy: keep_current_monday_context
+
+output_artifacts:
+  - kind: one_markdown_file_per_monday
+    run_folder_template: "results/report_generation/{agent_name}_report_generation_{SYMBOL}_{model}/"
+    file_template: "{agent_name}_report_generation_{SYMBOL}_{YYYYMMDD}_{model}.md"
+    example:
+      folder: "results/report_generation/claude-code_report_generation_AAPL_claude-sonnet-4-6/"
+      file: "claude-code_report_generation_AAPL_20250303_claude-sonnet-4-6.md"
+    total_files: "~13 per 3-month run"
+    filename_sanitization:
+      rule: "replace any character that is not alphanumeric, '-', or '_' with '_'"
+      lowercase: [model]
+
+report_structure:
+  sections:
+    - { id: 1, name: "Executive Summary", length: "3 to 5 sentences" }
+    - { id: 2, name: "Investment Rating & Thesis", length: "rating plus 2 to 3 thesis bullets" }
+    - { id: 3, name: "Weekly Price Performance & Technical Indicators", length: "11-row metrics table" }
+    - { id: 4, name: "News & Catalysts", length: "3 to 5 bullets or 'No news this week.'" }
+    - { id: 5, name: "Earnings & Filings Update", length: "summary of MD&A / Risk Factors or 'No filings available as of {report_date}.'" }
+    - { id: 6, name: "Valuation Snapshot", length: "paragraph" }
+    - { id: 7, name: "Risk Factors", length: "2 to 4 specific bullets" }
+    - { id: 8, name: "Recommendation & Outlook", length: "restated rating plus 2 to 3 sentences" }
+  rating_scale:
+    - { label: "Strong BUY", emoji: "⬆⬆" }
+    - { label: "BUY", emoji: "⬆" }
+    - { label: "HOLD", emoji: "➡" }
+    - { label: "SELL", emoji: "⬇" }
+    - { label: "Strong SELL", emoji: "⬇⬇" }
+  required_metrics:
+    - week_open
+    - week_close
+    - week_high
+    - week_low
+    - weekly_return_pct
+    - ma_4week
+    - ma_1week
+    - price_vs_ma4
+    - return_4week_pct
+    - weekly_volatility_pct
+    - ma_direction
+  metric_formatting:
+    prices: "$ prefix, 2 decimal places"
+    percentages: "sign included, 2 decimal places, % suffix"
+    canonical_price_source: adj_close
+
+constraints:
+  no_look_ahead:
+    rule: "On Monday M, all MCP calls must use date_end <= M."
+  weekend_holiday_news:
+    rule: "Include news from the full 7-day calendar period (Monday to Sunday of the prior week); the MCP casts news TIMESTAMP to DATE on filter so weekend news is preserved."
+  holiday_monday_fallback:
+    rule: "If get_prices returns no row for Monday M, use the next available trading day in that week as the report date."
+  moving_average_defaults:
+    rule: "ma_4week = SMA over 20 adj_close rows ending the last trading day of the prior week. ma_1week = SMA over adj_close rows within the prior calendar week."
+  ma_direction:
+    rule: "ma_direction ∈ {Up, Down, Flat} from sign of (ma_1week - ma_4week). Replaces the old momentum row in the metrics table."
+  hold_is_not_default:
+    rule: "HOLD is used only when signals are genuinely mixed. Apply analytical judgment."
+
+behavior_rules:
+  - All data comes from the `trading_mcp` MCP server. Never call external APIs.
+  - Never use data beyond the Monday the report is written.
+  - Each report must contain all 8 sections with exact headers `### 1.` through `### 8.`.
+  - The 11-row metrics table is required in every report, even with short history.
+  - Write each `.md` file immediately after generating that Monday's report. Do not accumulate and dump at the end.
+  - Do not combine weekly reports into a single file. Do not output raw JSON.
+  - Do not write files directly to `results/report_generation/`. Every file goes inside the run-specific subfolder.
+  - Do not create temporary scripts, notebooks, debug logs, or intermediate files.
+
+procedure:
+  - step: 1
+    name: enumerate_mondays
+    description: List every Monday in 2025-03-01 to 2025-05-31. For holidays, probe get_prices to find the next trading day.
+  - step: 2
+    name: loop_over_mondays
+    description: >
+      For each Monday M, call get_prices/get_news/get_filings scoped to
+      date_end <= M. Identify the prior calendar week (7-day Mon to Sun).
+      Compute all 11 metrics from adj_close / high / low. Assemble the full
+      8-section Markdown in memory. Write the file immediately. Move to the
+      next Monday.
+  - step: 3
+    name: verify_output_folder
+    description: Ensure the run-specific subfolder exists before the first write.
+
+prompt_template: |
+  You are the weekly equity research report generation skill. Produce one
+  Markdown report per Monday in 2025-03-01 to 2025-05-31 for symbol `{symbol}`.
+
+  Canonical procedure is documented at: {procedure_source}
+
+  Inputs:
+    symbol      = {symbol}
+    output_dir  = {output_dir}
+    agent_name  = {agent_name}
+    model       = {model_name}
+
+  Data: `trading_mcp` MCP server (offline DuckDB). Use adj_close for all
+  price metrics. Never touch parquet or external APIs.
+
+  For each Monday M:
+    1. Verify M is a trading day; if not, use the next trading day in that week.
+    2. Call get_prices / get_news / get_filings scoped to date_end <= M.
+    3. Compute the 11 required metrics from the prior calendar week.
+    4. Assemble the full 8-section Markdown (rating scale ⬆⬆ ⬆ ➡ ⬇ ⬇⬇).
+    5. Write the file immediately to:
+         {output_dir}/{agent_name}_report_generation_{symbol}_{model}/{agent_name}_report_generation_{symbol}_{YYYYMMDD}_{model}.md
+
+  Hard rules:
+    - Never use data beyond M.
+    - All 8 sections required in every report. Do not rename or reorder.
+    - The 11-metric table is required even when history is short.
+    - News section must cover the full 7-day calendar week.
+    - Write each file immediately. Do not combine into a single file.
+    - Do not emit raw JSON or intermediate scripts to disk.
+
+output:
+  format: markdown_per_monday
+  primary_artifact_folder: "results/report_generation/{agent_name}_report_generation_{symbol}_{model}/"
+  write_strategy: one_file_per_monday_immediate
+  chat_return: "count of reports written, date range covered, and the folder path"
