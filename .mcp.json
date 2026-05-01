@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "report_generation_mcp": {
+      "command": "python",
+      "args": [
+        "D:\\trading-analysis-claude-agent-sdk\\.claude\\skills\\report_generation\\scripts\\mcp\\report_generation_mcp.py",
+        "--db-path",
+        "D:\\trading-analysis-claude-agent-sdk\\env.duckdb"
+      ]
+    },
+    "report_evaluation_mcp": {
+      "command": "python",
+      "args": [
+        "D:\\trading-analysis-claude-agent-sdk\\.claude\\skills\\report_evaluation\\scripts\\mcp\\report_evaluation_mcp.py",
+        "--db-path",
+        "D:\\trading-analysis-claude-agent-sdk\\env.duckdb",
+        "--reports-root",
+        "D:\\trading-analysis-claude-agent-sdk\\results\\report_generation"
+      ]
+    }
+  }
+}

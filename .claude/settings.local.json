@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__report_generation_mcp__is_trading_day",
+      "mcp__report_generation_mcp__get_weekly_metrics",
+      "mcp__report_generation_mcp__list_news",
+      "mcp__report_generation_mcp__list_filings",
+      "mcp__report_generation_mcp__list_peers",
+      "mcp__report_generation_mcp__get_filing_section",
+      "Bash(python3:*)",
+      "Bash(python:*)",
+      "mcp__report_evaluation_mcp__list_reports",
+      "mcp__report_evaluation_mcp__get_report_metrics",
+      "mcp__report_evaluation_mcp__verify_weekly_metrics",
+      "mcp__report_evaluation_mcp__get_report_content",
+      "mcp__report_evaluation_mcp__get_forward_returns",
+      "mcp__report_evaluation_mcp__list_news",
+      "mcp__report_evaluation_mcp__list_filings",
+      "mcp__report_evaluation_mcp__get_filing_section",
+      "mcp__report_evaluation_mcp__search_news_titles",
+      "mcp__report_evaluation_mcp__check_news_leakage",
+      "mcp__report_evaluation_mcp__get_news_by_id"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "report_generation_mcp",
+    "report_evaluation_mcp"
+  ]
+}

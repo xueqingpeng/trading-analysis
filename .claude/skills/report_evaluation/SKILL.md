@@ -56,6 +56,14 @@ Evaluation helpers:
 - `get_forward_returns(symbol, report_date, horizons)`
 - `check_news_leakage(symbol, news_ids, report_date)`
 - `search_news(symbol, keywords, date_start, date_end, limit?, preview_chars?)` — returns `{id, date, highlights_chars, highlights_preview}`; call `get_news_by_id` to read a match in full.
+- `search_news_titles(symbol, keywords, date_start, date_end, limit?)` — searches titles only when available.
+
+**Important keyword argument rule:** for all news search tools, `keywords`
+must be a list of strings, not one space-separated string. For example, use
+`keywords=["tariff", "court", "blocked"]`, not
+`keywords="tariff court blocked"`. Likewise, use
+`keywords=["Goldman", "Sachs", "buy", "WWDC"]`, not
+`keywords="Goldman Sachs buy WWDC"`.
 
 News reading pattern (preview-then-drill, same as `report_generation`):
 - `list_news(symbol, date_start, date_end, preview_chars?)` returns previews
@@ -122,8 +130,9 @@ For each report:
 5. Call `list_filings(TICKER, report_date - 365 days, report_date)`,
    pick the latest row, then `get_filing_section(..., 'mda', limit=2500)`
    and `..., 'risk', limit=2500)` to spot-check the filing block.
-6. Use `search_news` (keyword) or `list_news` (date-range previews) to verify
-   concrete news claims, then `get_news_by_id` for full text on hits.
+6. Use `search_news` / `search_news_titles` with `keywords` as a list of
+   strings, or `list_news` (date-range previews), to verify concrete news
+   claims, then `get_news_by_id` for full text on hits.
 7. Build `metric_diffs`.
 8. Score the five dimensions below.
 

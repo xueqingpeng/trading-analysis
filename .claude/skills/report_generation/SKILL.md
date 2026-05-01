@@ -19,6 +19,21 @@ report through `upsert_report.py`.
 Everything you know about the market must come from the MCP tools described
 below. Do not call external APIs. Do not use network data.
 
+## Encoding Safety
+
+Generated Markdown must be UTF-8 compatible and use plain ASCII punctuation
+only. Avoid smart quotes, curly apostrophes, em dashes, en dashes, ellipses,
+non-ASCII math symbols, and any mojibake fragments such as `鈥?`.
+
+Use these ASCII forms instead:
+
+- straight apostrophe: `'`
+- straight quote: `"`
+- hyphen: `-`
+- arrow: `->`
+- multiplication: `x`
+- comparisons: `<=`, `>=`
+
 ---
 
 ## What this report is for
@@ -545,6 +560,8 @@ positive catalyst from news / filings.
 - Do not use external APIs.
 - Do not use data after `TARGET_DATE` (the SQL layer enforces this; do not
   attempt to bypass it).
+- Use plain ASCII punctuation only in the final Markdown report; never emit
+  smart punctuation or mojibake such as `鈥?`.
 - Do not skip required sections.
 - Do not fabricate facts not grounded in MCP-returned data.
 - Do not write files manually when `upsert_report.py` can do it.

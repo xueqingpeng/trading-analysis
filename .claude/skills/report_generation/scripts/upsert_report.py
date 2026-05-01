@@ -47,10 +47,47 @@ from pathlib import Path
 
 _FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9_-]")
 _RATING_CHOICES = ["STRONG_BUY", "BUY", "HOLD", "SELL", "STRONG_SELL"]
+_TEXT_REPLACEMENTS = {
+    # Smart punctuation -> plain ASCII. This keeps reports stable across
+    # Windows PowerShell, macOS terminals, Markdown renderers, and JSON tools.
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u2013": "-",
+    "\u2014": "-",
+    "\u2212": "-",
+    "\u2026": "...",
+    "\u00a0": " ",
+    "\u00d7": "x",
+    "\u2264": "<=",
+    "\u2265": ">=",
+    # Common mojibake fragments caused by UTF-8 text being decoded through a
+    # legacy Windows code page. These should never appear in generated reports.
+    "鈥?": "-",
+    "鈥檚": "'s",
+    "鈥檛": "'t",
+    "鈥檙": "'r",
+    "鈥檝": "'v",
+    "鈥檒": "'l",
+    "鈥渟": '"',
+    "鈥漰": '"',
+    "鈥": '"',
+    "鈭?": "-",
+    "脳": "x",
+    "鈮?": "<=",
+    "鈫?": "->",
+}
 
 
 def _sanitize(value: str) -> str:
     return _FILENAME_SAFE_RE.sub("_", value)
+
+
+def _normalize_report_text(value: str) -> str:
+    for old, new in _TEXT_REPLACEMENTS.items():
+        value = value.replace(old, new)
+    return value
 
 
 def main() -> None:
@@ -98,7 +135,7 @@ def main() -> None:
         body_stripped = body_stripped[3:].strip()
     if body_stripped.endswith("```"):
         body_stripped = body_stripped[:-3].strip()
-    body = body_stripped + "\n"
+    body = _normalize_report_text(body_stripped) + "\n"
 
     symbol_safe = _sanitize(args.symbol)
     model_safe = _sanitize(args.model).lower()
@@ -118,7 +155,7 @@ def main() -> None:
     # Load-or-create the summary JSON, upsert the record for this week's date.
     if summary_path.exists():
         try:
-            doc = json.loads(summary_path.read_text())
+            doc = json.loads(summary_path.read_text(encoding="utf-8"))
             if (
                 not isinstance(doc, dict)
                 or not isinstance(doc.get("recommendations"), list)
@@ -151,7 +188,10 @@ def main() -> None:
         "recommendations": recs,
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(json.dumps(doc, indent=2, ensure_ascii=False))
+    summary_path.write_text(
+        json.dumps(doc, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
     summary = {
         "path": str(summary_path),
