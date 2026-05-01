@@ -371,6 +371,15 @@ Do NOT predict specific price targets.
 
 Use the bundled write helper.
 
+Do not pass the Markdown report body through `echo '...'`, `printf '...'`, or
+any other single-quoted inline shell string. A single apostrophe inside the
+report body can break Bash parsing before `upsert_report.py` runs, producing
+errors such as `unexpected EOF while looking for matching \`''`.
+
+When using Bash, pass the report body through a quoted heredoc exactly like
+this. The closing `REPORT` delimiter must start at column 1 with no spaces or
+tabs before it:
+
 ```bash
 python3 .claude/skills/report_generation/scripts/upsert_report.py \
     --symbol TSLA \
@@ -382,6 +391,21 @@ python3 .claude/skills/report_generation/scripts/upsert_report.py \
 # Weekly Equity Research Report: TSLA
 ...full markdown body...
 REPORT
+```
+
+If running in Windows PowerShell rather than Bash, do not use Bash heredoc
+syntax. Pipe a PowerShell single-quoted here-string into Python instead:
+
+```powershell
+@'
+# Weekly Equity Research Report: TSLA
+...full markdown body...
+'@ | python .claude/skills/report_generation/scripts/upsert_report.py `
+    --symbol TSLA `
+    --target-date 2025-03-07 `
+    --action BUY `
+    --model claude-sonnet-4-6 `
+    --output-root <whatever the caller specified>
 ```
 
 | Flag            | Meaning |
