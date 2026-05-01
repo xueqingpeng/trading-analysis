@@ -1,381 +1,571 @@
 ---
 name: report_generation
 description: >
-  Generates a structured weekly equity research report for a single stock every
-  Monday over a 3-month window, using parquet data files containing price, news,
-  10-K, 10-Q, and momentum fields. Each report covers the prior week's price
-  action, news, and filings, computes key metrics, and issues a graduated BUY/SELL/HOLD
-  rating (Strong BUY → BUY → HOLD → SELL → Strong SELL) with supporting analysis.
-  All weekly reports for a run are stored as individual .md files inside a single
-  run-specific folder: results/report_generation/{agent_name}_report_generation_{ticker}_{model}/.
-
-  Use this skill whenever the user asks to generate an equity report, produce a
-  weekly stock report, write a research note, or evaluate report generation on
-  parquet data — even if they phrase it as "write a report for AAPL", "generate
-  weekly reports for NVDA", or "produce equity research for MSFT".
+  Generates one standalone WEEKLY equity research report for one symbol on
+  one target week-ending date. Uses the report_generation_mcp server to read
+  offline DuckDB market, news, filings, and peer benchmark data, then writes
+  one Markdown report plus a run-level summary JSON.
 ---
 
-# Report Generation Skill
+# Weekly Report Generation Skill
 
-You are generating weekly equity research reports for a single stock over a
-3-month window (2025-03-01 to 2025-05-31). Every **Monday** in this window,
-you write one structured report covering the **prior calendar week** (the full
-7-day period ending the previous Sunday, including weekends and holidays).
+You are generating a **single-week equity research report** for one symbol,
+covering the trading week ending on `TARGET_DATE` (typically a Friday).
 
-Each report must summarize price action, news, and any filings from that week,
-compute key metrics, and issue a graduated **Strong BUY / BUY / HOLD / SELL / Strong SELL** rating with rationale.
+You must use MCP tools on the `report_generation_mcp` server to read offline
+DuckDB data. Then you reason over the evidence and write one structured
+report through `upsert_report.py`.
 
-Integrity of the reports depends on never using information beyond what was
-available on the Monday the report is written. Read this skill carefully before
-starting.
-
-For input and output paths, the user will provide them directly. For example:
-"The data is at `/data/trading`", "Please save reports to `/results/report_generation`".
-
-A typical user request looks like:
-
-```
-Please generate weekly equity reports for AAPL. The input data is at /data/trading,
-please save the output to /results/report_generation.
-```
+Everything you know about the market must come from the MCP tools described
+below. Do not call external APIs. Do not use network data.
 
 ---
 
-## Setup
+## What this report is for
 
-### Identify the target ticker
+This is a **weekly investor letter**, not a daily trading note.
 
-The user will specify (or you can infer from context) which of the 10 available
-tickers to report on:
+A weekly report's value comes from putting the stock in market context:
 
-`AAPL`, `ADBE`, `AMZN`, `BMRN`, `CRM`, `GOOGL`, `META`, `MSFT`, `NVDA`, `TSLA`
+- Did it move with or against its sector this week?
+- Is the trend confirmed by momentum indicators?
+- How sensitive is it to broader market moves (beta)?
+- What's the structural setup heading into next week?
 
-The data file for ticker `XYZ` lives at:
+That is why the metric set is balanced toward **relative performance and
+beta**, not pure individual-stock alpha:
 
-```
-data/trading/XYZ-00000-of-00001.parquet
-```
-
-### Identify the agent name and model
-
-- `agent_name`: your agent name, e.g. `claude-code` or `codex`
-- `model`: your model identifier from system context (e.g. `claude-sonnet-4-6`);
-  sanitize for filename use (replace characters that are not alphanumeric, `-`, or
-  `_` with `_`, lowercase)
-
-### Ensure the output directory exists
-
-```
-results/report_generation/{agent_name}_report_generation_{ticker}_{model}/
-```
-
-Create it if it doesn't exist yet.
+| Block | Count | Purpose |
+|---|---|---|
+| Alpha (price / trend / position) | 8 | Where the stock is on its own |
+| Momentum signals | 3 | Direction confirmation (MACD, RSI, MA cross) |
+| **Beta (relative to sector)** | **5** | **How it moved vs the market** |
+| **Total** | **16** | |
 
 ---
 
-## Loading the data
+## Inputs
 
-Use Python + pandas to read the parquet file:
+The user invocation specifies:
 
-```python
-import pandas as pd
-df = pd.read_parquet("data/trading/TICKER-00000-of-00001.parquet")
-df['date'] = pd.to_datetime(df['date'])
-df = df.sort_values("date").reset_index(drop=True)
-```
+1. `SYMBOL` — one of:
+   `AAPL`, `ADBE`, `AMZN`, `GOOGL`, `META`, `MSFT`, `NVDA`, `TSLA`
+2. `TARGET_DATE` — the **last trading day of the report week**, in
+   `YYYY-MM-DD` format. This is typically a Friday but can be Thursday in a
+   short week or any other valid trading day. Optional. If omitted, call
+   `is_trading_day(SYMBOL, <best guess>)` and use the returned
+   `latest_date_in_db`.
 
-**Schema** — each row is one calendar date for the ticker:
+The "report week" is the **trading-day window from the Monday of
+`TARGET_DATE`'s ISO calendar week through `TARGET_DATE` (inclusive)**.
+Concretely the window starts at `TARGET_DATE - TARGET_DATE.weekday()` days,
+so Friday TARGET_DATE → Mon-Fri (5 trading days), Thursday TARGET_DATE
+(short week, e.g. Friday is a holiday) → Mon-Thu (4 trading days). A
+mid-week holiday (e.g. Wednesday closed) further reduces the count.
+Anchoring on Monday avoids pulling the prior week's Friday into "this
+week" when TARGET_DATE is not a Friday.
 
-| Field      | Type                    | Notes |
-|------------|-------------------------|-------|
-| `date`     | datetime                | calendar date; non-trading days may appear with news but NaN prices |
-| `asset`    | string                  | ticker symbol |
-| `prices`   | float64                 | daily close price |
-| `news`     | list[string] / ndarray  | summarized news for that day |
-| `10k`      | list[string] / ndarray  | 10-K excerpts (sparse) |
-| `10q`      | list[string] / ndarray  | 10-Q excerpts (sparse) |
-| `momentum` | string                  | `"up"`, `"down"`, or `"neutral"` |
+Typical user phrasings:
 
-**Important:** list fields may come back as `numpy.ndarray`. Use:
-
-```python
-import numpy as np
-
-def is_nonempty(val):
-    if val is None:
-        return False
-    if isinstance(val, (list, np.ndarray)):
-        return len(val) > 0
-    return bool(val)
-```
+- `weekly report for AAPL for week ending 2025-03-07`
+- `write weekly report for TSLA 2025-04-11`
+- `weekly report NVDA`
 
 ---
 
-## The report generation loop
+##  No Look-ahead
 
-Identify every **Monday** in the calendar range `2025-03-01` through `2025-05-31`.
-For each Monday, write one report using only data visible on or before that date.
-**Never read ahead.**
+The MCP server enforces a hard cap on look-ahead in **two layers**, not just
+in this prompt:
 
-```
-for each Monday M in [2025-03-01 .. 2025-05-31]:
-    1. Slice the dataframe to rows where date <= M  (no future data)
-    2. Identify the prior calendar week: the 7-day period Mon–Sun immediately
-       before M. Within that window:
-         - Trading days (rows where `prices` is not NaN): used for price metrics
-         - All rows with news (including weekends/holidays): used for news section
-    3. Compute metrics from the prior week's data
-    4. Write the report for Monday M
-    5. Move to the next Monday
-```
+1. **Range queries** (`get_prices`, `list_news`, `list_filings`,
+   `get_indicator`) — `date_end` is silently clamped to `as_of_date` at the
+   SQL layer.
+2. **Point queries** (`get_weekly_metrics`, `get_news_by_id`) — the tool
+   raises `ValueError` if `target_date > as_of_date`.
 
-If a Monday is not a trading day in the dataset (e.g., market holiday), use the
-next available trading day in that week as the report date.
+You physically cannot read data after `TARGET_DATE`.
 
 ---
 
-## Data available for each report
+## Data Access
 
-On Monday M, you may use:
+Use tools on the `report_generation_mcp` server. The table is ordered by
+the **typical call sequence** for one weekly report; see "Recommended
+Workflow" below for the full pattern. The last two tools (`get_prices`,
+`get_indicator`) are raw-access escape hatches — `get_weekly_metrics`
+already produces the 16 required metrics, so reach for these only when
+you want OHLCV context outside the metrics or a non-standard indicator
+parameter (e.g. RSI(7) instead of RSI(14)).
 
-- **Prior week's prices**: the trading days (non-NaN price rows) within the prior calendar week
-- **Prior week's news**: all news items from the full 7-day calendar period
-  (Monday through Sunday of the prior week) — include weekend and holiday news
-  even if no price data exists for those days
-- **All filings up to M**: any `10k` or `10q` excerpts on or before M
-- **Momentum**: the momentum label for the last trading day of the prior week
-- **Historical prices**: all non-NaN price rows up to and including the last trading
-  day of the prior week (for moving average and trend calculations)
+| Tool | Purpose |
+|---|---|
+| `is_trading_day(symbol, target_date)` | Gate the date — checks weekend / holiday / out-of-range in one call. |
+| `get_weekly_metrics(symbol, target_date)` | Return ALL 16 required weekly metrics in one call. **Always use this; never recompute manually.** |
+| `list_news(symbol, date_start, date_end, preview_chars?)` | Scan news in any window as **previews** (`{symbol, date, id, highlights_chars, highlights_preview}`). Default `preview_chars=600`. For the standard weekly scan call `list_news(SYM, TARGET_DATE - 7 days, TARGET_DATE)`; widen the window for 14/30-day catalyst sweeps. |
+| `get_news_by_id(symbol, id)` | Full article body (`highlights`) for one id. Standard drill-down step after `list_news` for items whose preview looks material. |
+| `list_filings(symbol, date_start, date_end, document_type?)` | Filing metadata (`{date, document_type, mda_chars, risk_chars}`) — no content. Use to find the most recent 10-K / 10-Q on or before `TARGET_DATE` and decide which section is worth reading. |
+| `get_filing_section(symbol, date, document_type, section, offset=0, limit=None)` | Read a specific filing section (`'mda'` or `'risk'`). Pass `limit=2500` for a preview, omit `limit` for full text, or use `offset`/`limit` to paginate long sections. |
+| `list_peers(symbol)` | Static peer list and sector label for thesis framing. |
+| `get_prices(symbol, date_start, date_end)` | Raw OHLCV when you need context beyond the 16 metrics. |
+| `get_indicator(symbol, date_start, date_end, indicator, length?)` | Custom indicator series with non-standard parameters. |
+
+### Rules
+
+- **Never compute metrics in ad-hoc Python.** Always use `get_weekly_metrics`.
+- For news and filings, follow the **preview-then-drill** pattern: scan with
+  `list_news` / `list_filings`, then call `get_news_by_id` /
+  `get_filing_section` only on the items worth reading in full. Pulling
+  every article's full body is wasteful.
+- Do not read duckdb directly.
+- Do not write ad-hoc scripts to disk.
 
 ---
 
-## Required metrics (compute for each report)
+## Recommended Workflow
 
-| Metric | Definition |
-|--------|-----------|
-| `week_open` | Price on the first trading day of the prior week |
-| `week_close` | Price on the last trading day of the prior week (not necessarily Friday if there was a holiday) |
-| `week_high` | Highest price among the trading days within the prior calendar week |
-| `week_low` | Lowest price among the trading days within the prior calendar week |
-| `weekly_return_pct` | `(week_close - week_open) / week_open × 100`, rounded to 2 decimal places |
-| `ma_4week` | Simple average of closing prices over the 20 trading days ending the last trading day of the prior week (or fewer if insufficient history) |
-| `ma_1week` | Simple average of closing prices over the trading days within the prior calendar week |
-| `price_vs_ma4` | `"above"` if `week_close > ma_4week`, `"below"` otherwise |
-| `return_4week_pct` | `(week_close - price_20_days_ago) / price_20_days_ago × 100`, rounded to 2 decimal places (use earliest available if fewer than 20 days of history) |
-| `weekly_volatility` | `(week_high - week_low) / week_open × 100`, rounded to 2 decimal places — measures intra-week price range as % of open |
-| `momentum` | The momentum label from the last day of the prior week (`"up"`, `"down"`, `"neutral"`) |
+1. **Gate the date.** Call `is_trading_day(SYMBOL, TARGET_DATE)`.
+   - `weekend` / `holiday` → The tool returns the most recent valid trading day in `prev_trading_day`. Do NOT guess or compute date math yourself. Instantly adopt `prev_trading_day` as your new `TARGET_DATE` and proceed to generate the report.
+   - `not_loaded` → stop and report to user.
+   - `trading_day` → continue.
+
+2. **Pull all 16 metrics in one call.** Call
+   `get_weekly_metrics(SYMBOL, TARGET_DATE)`. Save the entire dict; you'll
+   reference these values in Sections 1, 2, 3, 6, and 7.
+
+3. **Scan the week's news, then drill down.** Compute
+   `date_start = TARGET_DATE - 7 days` and call
+   `list_news(SYMBOL, date_start, TARGET_DATE)`. This returns **previews**
+   (first 600 chars per item by default) plus `highlights_chars`, not full
+   bodies. Read the previews to pick the items that materially matter for
+   the thesis, then call `get_news_by_id(SYMBOL, id)` for each one whose
+   preview shows it's worth reading in full. For a weekly report it is
+   normal to drill into 2–4 items; pulling every body is wasteful. If 7
+   days is too narrow, widen the window (e.g. 14 or 30 days for a catalyst
+   sweep).
+
+4. **Find and read the latest filing.** Call
+   `list_filings(SYMBOL, TARGET_DATE - 365 days, TARGET_DATE)` (one year
+   covers a 10-K plus three 10-Qs). Pick the most recent row to get
+   `(filing_date, document_type, mda_chars, risk_chars)`. Then call
+   `get_filing_section(SYMBOL, filing_date, document_type, 'mda', limit=2500)`
+   for the MD&A preview and another with `section='risk'` for Risk
+   Factors. Drop `limit` (or paginate via `offset`) if you need more text.
+   If `list_filings` returns empty, no 10-K/10-Q is available on or before
+   `TARGET_DATE` — say so in Section 5.
+
+5. **Pull peer / sector context.** Call `list_peers(SYMBOL)`.
+
+6. **(Optional)** Call `get_indicator` only for non-canonical parameters
+   (e.g., RSI(7) for a short-term overbought check) or time series.
+
+7. **Synthesize and write.** Assemble Markdown using the structure in
+   "Report Sections" below; call `upsert_report.py` to persist.
 
 ---
 
-## Report sections
+## Required Metrics (16 total)
 
-Each report must contain all **8** of the following sections, following the structure
-of professional equity research update notes (per CFA Institute and sell-side conventions):
+Each report MUST present all 16 in Section 3. Always retrieve them via
+`get_weekly_metrics`; the keys below match the dict keys returned.
+
+### Alpha block (8) — where the stock is on its own
+
+| Key | Definition |
+|---|---|
+| `week_open` | Open price of the first trading day in the report week |
+| `week_close` | `adj_close` on `TARGET_DATE` |
+| `weekly_return_pct` | `(week_close − prev_week_close) / prev_week_close × 100`. The base is the last `adj_close` BEFORE the report week. |
+| `return_4week_pct` | `(week_close − close_20_trading_days_ago) / close_20_trading_days_ago × 100`. Approximates one month. |
+| `ma_20day` | Average `adj_close` over the trailing 20 trading days |
+| `price_vs_ma20` | `"above"` if `week_close > ma_20day`, else `"below"` |
+| `weekly_volatility` | `stdev(daily_returns_in_week) × √5 × 100` — annualized-by-week |
+| `dist_from_52w_high_pct` | `(week_close − 52w_high) / 52w_high × 100`. Always ≤ 0; near 0 = stock is near its 52-week top |
+
+### Momentum block (3) — direction confirmation
+
+| Key | Definition |
+|---|---|
+| `momentum_short` | `"up"` if `ma_5day > ma_20day`, `"down"` if smaller, `"neutral"` if equal. Short-term trend direction |
+| `macd_signal` | One of `"bullish_strengthening"`, `"bullish_weakening"`, `"bearish_strengthening"`, `"bearish_weakening"`, `"neutral"`. Based on MACD(12, 26, 9). See "Reading MACD signals" below |
+| `rsi_14` | 14-period RSI value (numeric). Companion field `rsi_class` is `"overbought"` (>70), `"oversold"` (<30), or `"neutral"` |
+
+### Beta block (5) — how the stock moved vs the market
+
+The benchmark is an **equal-weighted basket of the symbol's sector peers**
+from `PEER_MAP` (returned in `benchmark_basket` for transparency). If the
+symbol's `benchmark_basket` comes back empty (no peers for that symbol are
+loaded in the current DB), all 5 beta-block metrics are `null`; explicitly
+note this limitation in Section 6 of those reports.
+
+| Key | Definition |
+|---|---|
+| `sector_basket_return_1w_pct` | Equal-weighted sector basket's weekly return, same window as the symbol's `weekly_return_pct` |
+| `relative_return_1w_pct` | `weekly_return_pct − sector_basket_return_1w_pct`. **Positive = outperformed sector; negative = underperformed.** This is the headline beta metric |
+| `relative_return_4w_pct` | Same as above but over 4 weeks (~20 trading days). Catches the medium-term trend in relative strength |
+| `correlation_60d` | 60-day rolling correlation between symbol's daily returns and basket's daily returns. High (>0.7) = moves with the sector; low (<0.4) = idiosyncratic |
+| `beta_60d` | 60-day rolling beta = `cov(symbol_returns, basket_returns) / var(basket_returns)`. **β > 1 = amplifies the sector**; β < 1 = dampened; β ≈ 0 = unrelated |
+
+### Context fields (returned by `get_weekly_metrics`, not in the table)
+
+| Key | Use |
+|---|---|
+| `ma_5day` | Used internally for `momentum_short`; available for thesis prose if helpful |
+| `macd_values` | `{line, signal, hist}` raw MACD numerics |
+| `rsi_class` | The bucketed RSI label, see above |
+| `week_trading_days` | Trading days actually in the window (5 normally, fewer in a holiday week) |
+| `benchmark_basket` | The list of peer symbols used; `[]` means no benchmark available |
+
+### Reading MACD signals
+
+The `macd_signal` field collapses MACD into a 5-class regime:
+
+- `bullish_strengthening` — MACD line above signal line **and** histogram is
+  growing → uptrend strengthening
+- `bullish_weakening` — MACD line above signal line **but** histogram is
+  shrinking → uptrend losing momentum
+- `bearish_strengthening` — MACD line below signal line **and** histogram is
+  growing more negative → downtrend strengthening
+- `bearish_weakening` — MACD line below signal line **but** histogram
+  recovering toward zero → downtrend losing force
+- `neutral` — MACD line essentially equal to signal line
+
+### Reading the beta block
+
+Three quick patterns to watch for:
+
+| Pattern | Reading |
+|---|---|
+| `weekly_return_pct < 0` but `relative_return_1w_pct > 0` | Stock fell, but **less than the sector** — defensive outperformance |
+| `correlation_60d` low **and** `relative_return_4w_pct` large | Stock has its own driver; sector framing is less informative |
+| `beta_60d > 1.2` and bullish momentum | High-beta name in an uptrend — leveraged exposure to sector tailwinds |
+| `beta_60d < 0.5` and `weekly_return_pct` large | Move was largely idiosyncratic, not a sector beta call |
+
+---
+
+## Report Sections
+
+Each report MUST contain all 8 sections in this order.
 
 ### 1. Executive Summary
-One paragraph (3–5 sentences) covering the single most important development of the
-week — the dominant price move, key news catalyst, or filing highlight. State the
-investment rating and a one-sentence thesis at the end.
+
+One concise paragraph (4–6 sentences) covering:
+- the week's overall direction (up / down / flat) using `weekly_return_pct`
+- **how it compared to the sector** using `relative_return_1w_pct` (this is
+  the lead for a weekly report; do not skip it)
+- the single most material development of the week
+- whether technical momentum confirms or contradicts the price action
 
 ### 2. Investment Rating & Thesis
-State the rating using the 5-level scale:
+**Rating: {RATING}**
 
-| Rating | When to use |
-|--------|-------------|
-| **Strong BUY** | Evidence is clearly and broadly positive across multiple signals |
-| **BUY** | Evidence leans positive but not all signals align |
-| **HOLD** | Signals are genuinely mixed; no clear directional lean |
-| **SELL** | Evidence leans negative but not uniformly so |
-| **Strong SELL** | Evidence is clearly and broadly negative across multiple signals |
+**The Market Debate:**
+- **Bulls are focusing on:** {1 sentence on the key bullish driver}
+- **Bears are concerned about:** {1 sentence on the key bearish risk}
 
-Then provide 2–3 bullet points explaining the **investment thesis** — the core
-reasons for the rating. Each bullet should be a distinct, evidence-based argument
-grounded in the week's data.
+**Core Logic:**
+- {thesis bullet 1, with cited metric / news / filing}
+- {thesis bullet 2}
+- {thesis bullet 3, ideally referencing relative-to-sector context}
 
-Apply your own analytical judgment — weigh price action, momentum, news sentiment,
-and any filing signals holistically. **HOLD is not the safe default**; use it only
-when you genuinely cannot determine a directional lean. Show your reasoning through
-the thesis bullets.
+State the rating using exactly one of:
+
+- `STRONG_BUY`, `BUY`, `HOLD`, `SELL`, `STRONG_SELL`
+
+Then provide **2–3 distinct, evidence-based thesis bullets**, each grounded
+in a specific metric, news item, or filing passage. For a weekly report, at
+least one bullet should explicitly reference the **relative-to-sector**
+context (e.g., *"AAPL outperformed the mega-cap basket by 2.7pp this week
+despite a market-wide sell-off"*) — unless the symbol has no benchmark.
+
+*Note: Keep thesis bullets focused on the high-level logic and impact. Do NOT redundantly summarize all news events here; leave the detailed event breakdowns for Section 4.*
 
 ### 3. Weekly Price Performance & Technical Indicators
-Present all computed metrics in a structured, readable format:
-- Open / Close / Weekly return %
-- Week High / Low / Intra-week volatility %
-- 1-week MA vs 4-week MA (whether the short MA is above or below the long MA indicates
-  recent trend direction)
-- Price vs 4-week MA: above or below
-- 4-week cumulative return %
-- Momentum label
+
+Present all 16 metrics in a structured Markdown table. See template below.
+
+If the symbol's `benchmark_basket` is empty, write `N/A (no peers in
+current dataset)` for all 5 beta-block rows.
+
+**Important:** Immediately below the table, write a brief "Technical Synthesis" paragraph (2–3 sentences). Interpret the relationship between volume, moving averages, and momentum. Note any obvious support/resistance levels or volume divergences (e.g., high-volume selling vs low-volume drift).
 
 ### 4. News & Catalysts
-Bullet-point summary of the **3–5 most significant news items** from the prior week,
-covering the full 7-day calendar period (including weekends and holidays — news on
-non-trading days is equally valid and must not be omitted).
-Each bullet: one to two sentences — what happened and why it matters for the stock.
-Group related items if the week had many similar stories.
-If no news was available, state that explicitly.
+
+First, assign a **Sentiment Thermometer** tag (one of: Euphoric, Cautiously Optimistic, Mixed, Defensive, Panic) summarizing the overall news tone for the week.
+
+Then, summarize the **3–5 most relevant news items** from the `list_news` scan.
+For each:
+- date and one-line summary
+- why it matters for the thesis (positive / negative / neutral)
+
+If the digest is empty: *"No material news for [SYMBOL] during the week ending [DATE]."*
 
 ### 5. Earnings & Filings Update
-Summarize any `10-K` or `10-Q` excerpts that became available on or before Monday M.
-Focus on content relevant to the investment thesis: revenue trends, margin commentary,
-forward guidance, or balance sheet signals. If no filings are available, state that
-explicitly.
 
-### 6. Valuation Snapshot
-Given the limited data available (price and filings only, no full financial statements),
-provide a simplified valuation commentary:
-- Note the stock's recent price trend relative to its 4-week MA as a momentum-based
-  fair value signal
-- If any financial data appears in `10-K` or `10-Q` excerpts (e.g., EPS, revenue,
-  margins), compute or cite relevant multiples
-- Comment on whether the stock appears stretched, fairly valued, or compressed
-  relative to its recent trading range and any available fundamental data
+If `list_filings` returned at least one row and you read the latest
+filing's MD&A and Risk Factors via `get_filing_section`:
+- Name the filing (e.g., "10-Q filed 2024-10-23")
+- Summarize the MD&A in 2–3 sentences
+- Summarize the most relevant Risk Factor in 1–2 sentences
+- *CRITICAL:* Acknowledge the filing date. If the filing is weeks or months old, explicitly frame it as the underlying structural fundamental background, NOT as a new catalyst for this week.
 
-### 7. Risk Factors
-List 2–4 **specific, evidence-based** risks from the week's data — regulatory,
-competitive, macro, operational, or sentiment risks visible in the news or filings.
-Each risk should be one sentence. Avoid generic boilerplate; tie each risk to actual
-content observed in the data.
+If `list_filings` returned empty: *"No 10-K or 10-Q documents are available on or before [DATE]."*
 
-### 8. Recommendation & Outlook
-Restate the rating. Then 2–3 sentences: what specific factors to monitor in the
-coming week, and what would cause a rating change (upside catalyst or downside trigger).
-Base all outlook commentary strictly on information available as of Monday M.
+### 6. Sector & Relative Performance
+
+This is the new section that distinguishes a weekly from a daily report.
+Comment on:
+
+- **Where the stock is in its sector this week** (`relative_return_1w_pct`)
+- **The medium-term relative trend** (`relative_return_4w_pct`)
+- **How sector-driven the stock is** (`correlation_60d`, `beta_60d`)
+- **Sector framing using `list_peers` output** — name the peers explicitly
+
+If `benchmark_basket` is empty, write a short paragraph stating: *"No peer
+benchmark is available in the current dataset for [SYMBOL]; sector
+relative performance cannot be computed. The remaining analysis relies on
+the absolute-return metrics in Section 3."*
+
+### 7. Risk Factors & Uncertainties
+
+List **2–3 specific, evidence-based risks** grounded in:
+- a metric (e.g., *"weekly_volatility of 4.2% is elevated"*),
+- a news item, or
+- a filing passage.
+
+Avoid boilerplate. If you cite macro risk, tie it to an observed metric or
+news item.
+
+**CRITICAL RULE ON MISSING CONTEXT:** If the stock experienced a major price move (e.g., a massive drop or surge) but `list_news` or other tools returned NO apparent reason, **do NOT invent or hallucinate a catalyst.** You must explicitly state in this section that the catalyst for the recent move is unclear based on available data.
+
+### 8. Recommendation, Outlook & Scenarios
+
+Restate the rating and explain **what to monitor in the upcoming week**:
+- specific catalysts (earnings, product launches, analyst events)
+- specific technical levels (e.g., "watch the 20-day MA at $238.42")
+
+Then, clearly outline the Bull/Bear scenarios (Upside/Downside Triggers):
+- **Upside Trigger / Bull Case:** What specific event, metric shift, or news would cause a rating upgrade?
+- **Downside Trigger / Bear Case:** What specific event, metric shift, or news would cause a rating downgrade or thesis breakdown (e.g., "if `relative_return_1w_pct` flips negative for two consecutive weeks")?
+
+Do NOT predict specific price targets.
 
 ---
 
-## Output format
+## Output Writing
 
-Write **one Markdown file per Monday report** to:
+Use the bundled write helper.
+
+```bash
+python3 .claude/skills/report_generation/scripts/upsert_report.py \
+    --symbol TSLA \
+    --target-date 2025-03-07 \
+    --action BUY \
+    --model claude-sonnet-4-6 \
+    --output-root <whatever the caller specified, e.g. /io/slot1> \
+    <<'REPORT'
+# Weekly Equity Research Report: TSLA
+...full markdown body...
+REPORT
+```
+
+| Flag            | Meaning |
+|-----------------|---|
+| `--symbol`      | Ticker symbol |
+| `--target-date` | Week-ending date in `YYYY-MM-DD` |
+| `--action`      | One of the five allowed rating tokens |
+| `--model`       | Actual model identifier used in filenames |
+| `--output-root` | **Pass the value the caller specified in the invocation** (e.g. `/io/slot1`). Falls back to `results/report_generation` (relative to cwd) only if no value was given — that default is rarely writable inside a sandbox, so omitting it usually causes a `PermissionError`. |
+
+Files written:
 
 ```
-results/report_generation/{agent_name}_report_generation_{ticker}_{model}/{agent_name}_report_generation_{ticker}_{YYYYMMDD}_{model}.md
+{output_root}/report_generation_{symbol}_{model}.json
+{output_root}/report_generation_{symbol}_{model}/report_generation_{symbol}_{YYYYMMDD}_{model}.md
 ```
 
-Where `{YYYYMMDD}` is the report date (the Monday). Example for the first report:
-
-```
-results/report_generation/claude-code_report_generation_AAPL_claude-sonnet-4-6/claude-code_report_generation_AAPL_20250303_claude-sonnet-4-6.md
-```
-
-A 3-month run covering ~13 Mondays produces **~13 separate `.md` files** in the
-output directory — one per weekly report, analogous to how the trading skill
-produces one decision record per trading day.
-
-Each file is a single self-contained report. Use the exact template below:
+Calling the script with the same `--target-date` overwrites that week's
+entry.
 
 ---
+
+## Output Format
+
+Use this Markdown template exactly. Replace `{...}` with computed values.
 
 ````markdown
-# Equity Research Report: {TICKER}
+# Weekly Equity Research Report: {TICKER}
 
-**Agent:** {agent_name} | **Model:** {model} | **Report Date:** {report_date}
-**Week Covered:** {week_start} to {week_end} | **Rating:** {RATING_EMOJI} {RATING}
+**Model:** {model} | **Week Ending:** {TARGET_DATE}
+**Rating:** {RATING}
 
 ---
 
 ### 1. Executive Summary
-{3–5 sentence paragraph}
+{4–6 sentence paragraph; lead with stock's move AND its move vs sector}
 
 ---
 
 ### 2. Investment Rating & Thesis
 **Rating: {RATING}**
 
-- {thesis bullet 1}
+**The Market Debate:**
+- **Bulls are focusing on:** {1 sentence on the key bullish driver}
+- **Bears are concerned about:** {1 sentence on the key bearish risk}
+
+**Core Logic:**
+- {thesis bullet 1, with cited metric / news / filing}
 - {thesis bullet 2}
-- {thesis bullet 3}
+- {thesis bullet 3, ideally referencing relative-to-sector context}
+
 
 ---
 
 ### 3. Weekly Price Performance & Technical Indicators
 
-| Metric                   | Value        |
-|--------------------------|--------------|
-| Open                     | $227.45      |
-| Close                    | $229.10      |
-| Weekly Return            | +0.73%       |
-| Week High                | $231.50      |
-| Week Low                 | $226.80      |
-| Intra-week Volatility    | 2.07%        |
-| 1-Week MA                | $228.60      |
-| 4-Week MA                | $228.30      |
-| Price vs 4-Week MA       | Above        |
-| 4-Week Cumulative Return | -1.24%       |
-| Momentum                 | Neutral      |
+| Metric | Value |
+|---|---|
+| **Alpha block** | |
+| Week Open | {week_open} |
+| Week Close | {week_close} |
+| Weekly Return | {weekly_return_pct}% |
+| 4-Week Return | {return_4week_pct}% |
+| 20-Day MA | {ma_20day} |
+| Price vs 20-Day MA | {price_vs_ma20} |
+| Weekly Volatility | {weekly_volatility}% |
+| Distance from 52-Week High | {dist_from_52w_high_pct}% |
+| 20-Day Support | {support_20d} |
+| 20-Day Resistance | {resistance_20d} |
+| **Momentum & Volume block** | |
+| Short-term Momentum | {momentum_short} |
+| MACD Signal | {macd_signal} |
+| RSI (14) | {rsi_14} ({rsi_class}) |
+| Volume Ratio (vs 20d avg) | {volume_ratio} |
+| Chaikin Money Flow (20d) | {cmf_20day} |
+| **Beta block (vs equal-weighted sector basket)** | |
+| Sector Basket Return (1W) | {sector_basket_return_1w_pct}% |
+| Relative Return (1W) | {relative_return_1w_pct}% |
+| Relative Return (4W) | {relative_return_4w_pct}% |
+| Correlation (60D) | {correlation_60d} |
+| Beta (60D) | {beta_60d} |
+
+**Technical Synthesis:**
+{2-3 sentences analyzing support/resistance, moving average trends, and volume confirmation/divergence.}
 
 ---
 
 ### 4. News & Catalysts
-- **{headline}:** {1–2 sentence impact summary}
-- **{headline}:** {1–2 sentence impact summary}
+
+**Sentiment Thermometer:** [ Euphoric | Cautiously Optimistic | Mixed | Defensive | Panic ]
+
+- **{date}** — {headline summary}. {why it matters}.
+- **{date}** — {headline summary}. {why it matters}.
+- **{date}** — {headline summary}. {why it matters}.
 
 ---
 
 ### 5. Earnings & Filings Update
-{Summary of 10-K/10-Q content, or "No filings available as of {report_date}."}
+{Summary referencing the filing date and document_type, plus 2–3 sentences
+on MD&A and 1–2 sentences on Risk Factors. Or "No new 10-K or 10-Q on or
+before {DATE}."}
 
 ---
 
-### 6. Valuation Snapshot
-{Paragraph: price vs MA commentary, any multiples from filings if available,
-overall fair value assessment}
+### 6. Sector & Relative Performance
+{Paragraph covering relative_return_1w_pct, relative_return_4w_pct,
+correlation_60d, beta_60d. Name the peers from list_peers explicitly.
+If benchmark_basket is empty, state the limitation.}
 
 ---
 
 ### 7. Risk Factors
-- {Specific risk 1 tied to observed data}
-- {Specific risk 2}
-- {Specific risk 3}
+- {risk 1 with cited evidence}
+- {risk 2 with cited evidence}
 
 ---
 
-### 8. Recommendation & Outlook
-**{RATING}.** {2–3 sentences on what to monitor next week and what would trigger
-a rating change.}
+### 8. Recommendation, Outlook & Scenarios
+{Restate rating. What to monitor next week: catalysts, technical levels,
+relative-strength triggers.}
 ````
 
 ---
 
-**Format rules:**
+## Worked Example: Reading the Metrics
 
-| Element | Rule |
-|---------|------|
-| Rating emoji | ⬆⬆ Strong BUY, ⬆ BUY, ➡ HOLD, ⬇ SELL, ⬇⬇ Strong SELL — on the header line |
-| Metrics table | All 11 metrics required; use `$` prefix for prices, `%` suffix for returns |
-| Prices | Round to 2 decimal places |
-| Percentages | Include sign (`+0.73%`, `-1.24%`); round to 2 decimal places |
-| News bullets | Bold the headline or topic as the bullet label |
-| Section headers | Use exact `###` level shown; do not rename or reorder sections |
-| Horizontal rules | `---` between each section within a report |
-| Empty data | State explicitly ("No news this week.", "No filings available.") |
+Suppose `get_weekly_metrics("AAPL", "2025-03-07")` returns:
 
-**Write each file immediately** after generating that Monday's report — do not
-accumulate all reports in memory and write at the end.
+```json
+{
+  "week_open": 241.79, "week_close": 238.03,
+  "weekly_return_pct": -1.15, "return_4week_pct": 2.62,
+  "ma_20day": 238.42, "price_vs_ma20": "below",
+  "weekly_volatility": 2.34, "dist_from_52w_high_pct": -8.48,
+
+  "momentum_short": "down", "macd_signal": "bearish_weakening",
+  "rsi_14": 50.8, "rsi_class": "neutral",
+
+  "sector_basket_return_1w_pct": -3.85,
+  "relative_return_1w_pct": 2.70,
+  "relative_return_4w_pct": 13.24,
+  "correlation_60d": 0.338,
+  "beta_60d": 0.381,
+
+  "benchmark_basket": ["MSFT", "GOOGL", "AMZN", "META"]
+}
+```
+
+How to read this set:
+
+- **Absolute direction:** Down week (-1.15%) but only modestly. 4-week
+  return is still positive (+2.62%) — uptrend not broken in absolute terms.
+- **Relative direction:** This is the headline. The mega-cap basket fell
+  3.85%; AAPL fell only 1.15% — outperformed by 2.70pp. Over 4 weeks, AAPL
+  beat the basket by 13.24pp. **AAPL is leading the sector**.
+- **Beta posture:** `beta_60d = 0.38` is unusually low for AAPL, suggesting
+  this week's relative outperformance came from idiosyncratic strength, not
+  sector amplification. `correlation_60d = 0.34` confirms the move is more
+  AAPL-specific than sector-driven.
+- **Trend posture:** Price below MA20, `momentum_short = "down"`,
+  `macd_signal = "bearish_weakening"`. So momentum has rolled over but the
+  downtrend is losing force.
+- **Cycle position:** -8.48% from 52-week high — pulled back but not
+  broken.
+
+A coherent thesis from this set is `HOLD` or `BUY`: short-term technicals
+are soft but the stock is **clearly leading its sector** on a relative
+basis. The `bearish_weakening` MACD plus low beta argues against `SELL` —
+the worst of the downtrend may be priced in. A `STRONG_BUY` would need a
+positive catalyst from news / filings.
 
 ---
 
-## What NOT to do
+## Hard Constraints
 
-- Do not use any data beyond what was available on the Monday the report is written
-- Do not invent price levels, news, or filing content not present in the parquet data
-- Do not skip any calendar Monday in the window without a reason (holiday = use next trading day)
-- Do not write partial reports — all 8 sections must be present for every weekly report
-- Do not rename or reorder the section headers
-- Do not leave the metrics table incomplete — compute all 11 metrics from available history
-  even if the window is shorter than 20 days (use whatever history exists)
-- Do not create temporary `.py` files, notebooks, debug logs, or intermediate files
-- Do not combine all weekly reports into a single output file — each Monday must produce its own `.md` file
-- Do not write report files directly to `results/report_generation/` — all files must go inside the run-specific subfolder `{agent_name}_report_generation_{ticker}_{model}/`
-- Do not output raw JSON — the output must be `.md` Markdown files
+- Do not use external APIs.
+- Do not use data after `TARGET_DATE` (the SQL layer enforces this; do not
+  attempt to bypass it).
+- Do not skip required sections.
+- Do not fabricate facts not grounded in MCP-returned data.
+- Do not write files manually when `upsert_report.py` can do it.
+- Do not compute metrics in ad-hoc Python; always use `get_weekly_metrics`.
+- Do not predict specific future prices.
+- If `benchmark_basket` comes back empty, do not invent a sector benchmark;
+  state the limitation in Section 6.
+- - On Windows, never use bash heredoc (cat << EOF). Never create temporary Python scripts to query the database. All data must come from MCP tools only.
 
 ---
 
-## Implementation approach
+## Success Condition
 
-The cleanest approach: write a short inline Python script via the Bash tool that
-loads the parquet, identifies all calendar Mondays in the window, then loops over them
-chronologically. For each Monday, compute all 11 metrics, assemble the full
-Markdown report in memory, and write it immediately to its own dated `.md` file
-before moving to the next Monday. A 3-month window produces ~13 files. Do not
-save the script to disk.
+You succeed when you have:
+
+1. gated `TARGET_DATE` with `is_trading_day` and confirmed it is a trading
+   day in the report week
+2. retrieved all 16 metrics in one `get_weekly_metrics` call
+3. retrieved news and filings via the digest / highlights tools
+4. produced one coherent Markdown report covering all 8 sections, with
+   every non-trivial claim traceable to MCP-returned data
+5. for symbols with a benchmark basket, written Section 6 covering relative
+   performance and beta context
+6. written the Markdown report and summary JSON through `upsert_report.py`

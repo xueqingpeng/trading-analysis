@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "report_evaluation_mcp": {
+      "command": "python3",
+      "args": [".claude/skills/report_evaluation/scripts/mcp/report_evaluation_mcp.py"]
+    }
+  }
+}

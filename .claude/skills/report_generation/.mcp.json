@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "report_generation_mcp": {
+      "command": "python3",
+      "args": [".claude/skills/report_generation/scripts/mcp/report_generation_mcp.py"]
+    }
+  }
+}
