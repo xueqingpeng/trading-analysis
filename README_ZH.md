@@ -1,6 +1,6 @@
 # Claude Agent Trading（中文文档）
 
-通过 [Claude Agent SDK](https://docs.anthropic.com/en/docs/claude-code/agent-sdk) 自动运行 `financial_agentic_benchmark` 的四个 skill：**trading**、**report_generation**、**report_evaluation**、**auditing**。
+通过 [Claude Agent SDK](https://docs.anthropic.com/en/docs/claude-code/agent-sdk) 自动运行 `financial_agentic_benchmark` 的五个 skill：**trading**、**hedging**、**report_generation**、**report_evaluation**、**auditing**。
 
 Skill 定义在项目自带的 `.claude/skills/` 目录下，Agent SDK 通过 `setting_sources=["project"]` 自动发现加载，无需手动注册。
 
@@ -72,10 +72,11 @@ python run_benchmark.py trading \
     --db-path  ./env.duckdb \
     --output   /path/to/results/trading
 
-# report-generation — 3 个月窗口内按周生成股票研报
+# report-generation — 按日期区间在 DuckDB 上跑 weekly-loop 报告生成
 python run_benchmark.py report-generation \
-    --benchmark-root /path/to/financial_agentic_benchmark \
-    --ticker TSLA
+    --symbol TSLA --start 2025-01-01 --end 2025-03-31 \
+    --db-path ./env.duckdb \
+    --output  /path/to/results/report_generation
 
 # report-evaluation — 评估 report-generation 产出的 .md 报告
 python run_benchmark.py report-evaluation \
@@ -325,23 +326,43 @@ exactly as given (do not substitute your own model name).
 - **单 case 模式** —— 永远重跑。`write_audit.py` 会覆盖已存在的预测文件名。
 - **批量模式** —— 默认 `resume=True`。每个 prompt 跑前 runner 先预测 `write_audit.py` 会写出的精确文件名；如果已存在 `--output-root` 里就**跳过**。跳过的 case 不消耗预算（$0），日志显示为 `SKIP (resume)`。中途 error 的 case 没产出文件 → 下次重跑会被自动重试。想强制全部重跑，加 `--no-resume`。
 
-### report-generation — 3 个月窗口的每周股票研究报告
+### report-generation — 单只股票的每周股票研究报告
 
-**Runner（一次调用）：**
+**Runner（按日期循环，`[start, end]` 中每个周五调用一次 agent）：**
 
 ```bash
 ./run_docker.sh report-generation --verbose \
-    --benchmark-root /path/to/financial_agentic_benchmark \
-    --ticker TSLA
+    --symbol TSLA --start 2025-01-01 --end 2025-03-31 \
+    --db-path ./env.duckdb \
+    --output  ./results/report_generation
 ```
 
-**Raw prompt：**
+Runner 在 `[start, end]` 内逐**周五**迭代。如果 `--start` 不是周五，自动前进到下一个周五。某周周五是市场假期时，skill 内部的 `is_trading_day` 会自动 fallback 到前一交易日（通常是周四）。每个 TARGET_DATE 对应的"报告周"是该 ISO 周的周一 → TARGET_DATE，所以周一是假日时窗口自动收缩到 4 个交易日，**不会跨上周**。
+
+**单个周五发给 agent 的 raw prompt：**
 
 ```
-Please generate weekly equity reports for TSLA. The input data is at
-/io/slot0/data/trading, please save the output to
-/io/slot1/results/report_generation.
+Generate the weekly equity research report for TSLA for the week ending 2025-03-07.
+
+Your turn is NOT complete unless you have actually invoked the Bash tool to run
+`python3 .claude/skills/report_generation/scripts/upsert_report.py` with all
+required flags AND piped the full Markdown report on stdin. A text-only response
+that merely describes or announces the report is a FAILURE — the result file
+will not exist on disk. Do not stop, do not write a summary, do not say the
+report has been written until the Bash call has returned its one-line JSON
+success summary.
+
+When calling upsert_report.py, pass --symbol=TSLA --target-date=2025-03-07
+--output-root=/io/slot1 and --model=gpt-5.4 exactly as given (do not substitute
+your own model name).
 ```
+
+**输出（`upsert_report.py` 写入）：**
+
+- `<output>/report_generation_<symbol>_<model>.json` — 总览记录列表，每生成一周追加一条
+- `<output>/report_generation_<symbol>_<model>/report_generation_<symbol>_<YYYYMMDD>_<model>.md` — 每周一份 Markdown 正文
+
+**断点续传行为：** 每个迭代到的周五都会再发给 agent 跑。输出文件以 `--symbol` × `--model` 为粒度（一个 summary JSON），重跑同一周会**覆盖**该周记录（`upsert_report.py` 按 target-date upsert），同时改写该周的 `.md`。**没有自动跳过** —— 想只填空缺，请收紧 `--start` / `--end` 范围。
 
 ### report-evaluation — 给之前 report-generation 跑出来的报告打分
 
@@ -380,20 +401,32 @@ Runner 在 raw prompt 之上多做了三件事：(1) 按日 / 按 case 循环；
 
 ## Python API
 
-```python
-from claude_agent_trading import BenchmarkTask, run_benchmark_task
+每个 runner 都对应一个 range-runner 函数，可以直接在 Python 里调用：
 
-result = run_benchmark_task(
-    BenchmarkTask(
-        task_type="report_generation",
-        ticker="TSLA",
-        benchmark_root="/path/to/financial_agentic_benchmark",
+```python
+from datetime import date
+from pathlib import Path
+from claude_agent_trading import (
+    ReportGenerationWeeklyConfig,
+    run_report_generation_range,
+)
+
+result = run_report_generation_range(
+    ReportGenerationWeeklyConfig(
+        symbol="TSLA",
+        start=date(2025, 1, 1),
+        end=date(2025, 3, 31),
+        output_dir=Path("./results/report_generation").resolve(),
+        db_path=Path("./env.duckdb").resolve(),
     )
 )
 
-print(result.agent_result.result)
-print(f"Cost: ${result.agent_result.cost_usd:.4f}")
+print(f"已生成周数: {len(result.per_week)}")
+print(f"错误数: {result.num_errors}")
+print(f"总费用: ${result.total_cost_usd:.4f}")
 ```
+
+trading / hedging / auditing 的对应入口分别是 `run_trading_range(TradingDailyConfig)`、`run_hedging_range(HedgingDailyConfig)`、`run_auditing(AuditingConfig)` / `run_auditing_batch(AuditingBatchConfig)`。旧的 `BenchmarkTask` + `run_benchmark_task` 路径现在只服务于 `report-evaluation`。
 
 ---
 
@@ -412,6 +445,9 @@ trading-analysis/
 │   ├── benchmark.py            # 任务定义与 prompt 构建
 │   ├── benchmark_cli.py        # CLI 参数解析
 │   ├── trading_daily.py        # 单日 trading skill 的 daily-loop orchestrator
+│   ├── hedging_daily.py        # 单日 hedging skill 的 daily-loop orchestrator
+│   ├── report_generation_weekly.py  # report_generation 的 weekly-loop orchestrator（[start, end] 内每个周五一次）
+│   ├── auditing_runner.py      # auditing 的单 case + 批量 orchestrator
 │   └── providers.py            # API key / .env / 模型别名解析
 ├── claude_proxy/
 │   ├── proxy.py                # Claude API → OpenAI 兼容协议代理（端口 18080）

@@ -1,6 +1,6 @@
 # Claude Agent Trading
 
-Run the four `financial_agentic_benchmark` skills — **trading**, **report_generation**, **report_evaluation**, **auditing** — via the [Claude Agent SDK](https://docs.anthropic.com/en/docs/claude-code/agent-sdk).
+Run the five `financial_agentic_benchmark` skills — **trading**, **hedging**, **report_generation**, **report_evaluation**, **auditing** — via the [Claude Agent SDK](https://docs.anthropic.com/en/docs/claude-code/agent-sdk).
 
 Skills live under `.claude/skills/` and are auto-discovered by the SDK through `setting_sources=["project"]`; no manual registration is needed.
 
@@ -72,10 +72,11 @@ python run_benchmark.py trading \
     --db-path  ./env.duckdb \
     --output   /path/to/results/trading
 
-# report-generation — weekly equity reports over a 3-month window
+# report-generation — weekly-loop skill over a date range, queries DuckDB via MCP
 python run_benchmark.py report-generation \
-    --benchmark-root /path/to/financial_agentic_benchmark \
-    --ticker TSLA
+    --symbol TSLA --start 2025-01-01 --end 2025-03-31 \
+    --db-path ./env.duckdb \
+    --output  /path/to/results/report_generation
 
 # report-evaluation — scores reports produced by report-generation
 python run_benchmark.py report-evaluation \
@@ -325,23 +326,43 @@ exactly as given (do not substitute your own model name).
 - **Single-case mode** — always re-runs. `write_audit.py` overwrites the predicted filename if it exists.
 - **Batch mode** — `resume=True` by default. Before each prompt the runner predicts the exact filename `write_audit.py` would produce and **skips** the case if that file is already in `--output-root`. Skipped cases cost $0 and show up as `SKIP (resume)` in the per-task log. Cases that errored out leave no output file → automatically retried on the next run. Pass `--no-resume` to force re-run of every case.
 
-### report-generation — weekly equity reports over 3 months
+### report-generation — weekly equity reports for one stock
 
-**Runner (one shot):**
+**Runner (loops over the date range, one agent per Friday in `[start, end]`):**
 
 ```bash
 ./run_docker.sh report-generation --verbose \
-    --benchmark-root /path/to/financial_agentic_benchmark \
-    --ticker TSLA
+    --symbol TSLA --start 2025-01-01 --end 2025-03-31 \
+    --db-path ./env.duckdb \
+    --output  ./results/report_generation
 ```
 
-**Raw prompt:**
+The runner iterates each **Friday** in `[start, end]`. If `--start` is not a Friday, it advances to the next Friday. When a Friday is a market holiday, the skill's `is_trading_day` falls back to the prior trading day (typically Thursday) automatically. The "report week" anchored on each TARGET_DATE covers Monday → TARGET_DATE of that ISO calendar week, so a Monday holiday simply shrinks the window to 4 trading days without crossing into the prior week.
+
+**Raw prompt sent to the agent for ONE Friday:**
 
 ```
-Please generate weekly equity reports for TSLA. The input data is at
-/io/slot0/data/trading, please save the output to
-/io/slot1/results/report_generation.
+Generate the weekly equity research report for TSLA for the week ending 2025-03-07.
+
+Your turn is NOT complete unless you have actually invoked the Bash tool to run
+`python3 .claude/skills/report_generation/scripts/upsert_report.py` with all
+required flags AND piped the full Markdown report on stdin. A text-only response
+that merely describes or announces the report is a FAILURE — the result file
+will not exist on disk. Do not stop, do not write a summary, do not say the
+report has been written until the Bash call has returned its one-line JSON
+success summary.
+
+When calling upsert_report.py, pass --symbol=TSLA --target-date=2025-03-07
+--output-root=/io/slot1 and --model=gpt-5.4 exactly as given (do not substitute
+your own model name).
 ```
+
+**Outputs (written by `upsert_report.py`):**
+
+- `<output>/report_generation_<symbol>_<model>.json` — summary record list, one entry per generated week
+- `<output>/report_generation_<symbol>_<model>/report_generation_<symbol>_<YYYYMMDD>_<model>.md` — per-week Markdown body
+
+**Resume behaviour:** every iterated Friday is re-sent to the agent. The output is one summary JSON per `--symbol` / `--model`; re-running **overwrites** any week that already has a record (via `upsert_report.py`'s upsert-by-target-date) and rewrites that week's `.md`. There is no auto-skip — to fill only gaps, narrow `--start` / `--end`.
 
 ### report-evaluation — score reports a previous report-generation run produced
 
@@ -380,20 +401,32 @@ The runner adds three things on top of the raw prompt: (1) per-day / per-case lo
 
 ## Python API
 
-```python
-from claude_agent_trading import BenchmarkTask, run_benchmark_task
+Each runner has a corresponding range-runner function that you can call directly:
 
-result = run_benchmark_task(
-    BenchmarkTask(
-        task_type="report_generation",
-        ticker="TSLA",
-        benchmark_root="/path/to/financial_agentic_benchmark",
+```python
+from datetime import date
+from pathlib import Path
+from claude_agent_trading import (
+    ReportGenerationWeeklyConfig,
+    run_report_generation_range,
+)
+
+result = run_report_generation_range(
+    ReportGenerationWeeklyConfig(
+        symbol="TSLA",
+        start=date(2025, 1, 1),
+        end=date(2025, 3, 31),
+        output_dir=Path("./results/report_generation").resolve(),
+        db_path=Path("./env.duckdb").resolve(),
     )
 )
 
-print(result.agent_result.result)
-print(f"Cost: ${result.agent_result.cost_usd:.4f}")
+print(f"Weeks generated: {len(result.per_week)}")
+print(f"Errors: {result.num_errors}")
+print(f"Total cost: ${result.total_cost_usd:.4f}")
 ```
+
+For trading / hedging / auditing the parallel entry points are `run_trading_range(TradingDailyConfig)`, `run_hedging_range(HedgingDailyConfig)`, `run_auditing(AuditingConfig)` / `run_auditing_batch(AuditingBatchConfig)`. The legacy `BenchmarkTask` + `run_benchmark_task` path is now only used for `report-evaluation`.
 
 ---
 
@@ -412,6 +445,9 @@ trading-analysis/
 │   ├── benchmark.py            # Task definitions & prompt building
 │   ├── benchmark_cli.py        # CLI argument parsing
 │   ├── trading_daily.py        # Daily-loop orchestrator for the trading skill
+│   ├── hedging_daily.py        # Daily-loop orchestrator for the hedging skill
+│   ├── report_generation_weekly.py  # Weekly-loop orchestrator (one Friday per week in [start, end])
+│   ├── auditing_runner.py      # Single-case + batch orchestrator for the auditing skill
 │   └── providers.py            # API key / .env / model-alias resolution
 ├── claude_proxy/
 │   ├── proxy.py                # Claude API → OpenAI-compatible proxy (port 18080)

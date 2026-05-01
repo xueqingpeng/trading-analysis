@@ -28,6 +28,11 @@ from .hedging_daily import (
     HedgingRangeResult,
     run_hedging_range,
 )
+from .report_generation_weekly import (
+    ReportGenerationRangeResult,
+    ReportGenerationWeeklyConfig,
+    run_report_generation_range,
+)
 from .auditing_runner import (
     AuditingBatchConfig,
     AuditingBatchResult,
@@ -66,12 +71,9 @@ def main() -> None:
 
     report_gen_parser = subparsers.add_parser(
         "report-generation",
-        help="Run the report_generation skill",
+        help="Drive the single-week report_generation skill once per Friday over a date range",
     )
-    _add_single_task_common_args(report_gen_parser)
-    report_gen_parser.add_argument("--ticker", required=True, help="Ticker symbol, e.g. TSLA")
-    report_gen_parser.add_argument("--data-root", default=None, help="Trading parquet directory")
-    report_gen_parser.add_argument("--output-root", default=None, help="Output directory for markdown reports")
+    _add_report_generation_weekly_args(report_gen_parser)
 
     report_eval_parser = subparsers.add_parser(
         "report-evaluation",
@@ -120,6 +122,13 @@ def main() -> None:
         hedging_result = _run_hedging_from_args(args, callbacks)
         _emit_hedging_range_result(hedging_result, as_json=args.json)
         if hedging_result.config.fail_fast and hedging_result.num_errors > 0:
+            sys.exit(1)
+        return
+
+    if args.command == "report-generation":
+        report_result = _run_report_generation_from_args(args, callbacks)
+        _emit_report_generation_range_result(report_result, as_json=args.json)
+        if report_result.config.fail_fast and report_result.num_errors > 0:
             sys.exit(1)
         return
 
@@ -180,15 +189,7 @@ def _task_from_args(args: argparse.Namespace) -> BenchmarkTask:
         "max_budget_usd": args.max_budget,
     }
 
-    if task_type == "report_generation":
-        payload.update(
-            {
-                "ticker": args.ticker,
-                "data_root": args.data_root,
-                "output_root": args.output_root,
-            }
-        )
-    elif task_type == "report_evaluation":
+    if task_type == "report_evaluation":
         payload.update(
             {
                 "ticker": args.ticker,
@@ -202,8 +203,8 @@ def _task_from_args(args: argparse.Namespace) -> BenchmarkTask:
     else:
         raise ValueError(
             f"_task_from_args does not handle task_type={task_type!r}. "
-            "trading / hedging / auditing each have dedicated runners; "
-            "this helper is only for report-generation / report-evaluation."
+            "trading / hedging / report-generation / auditing each have "
+            "dedicated runners; this helper is only for report-evaluation."
         )
     return BenchmarkTask(**payload)
 
@@ -453,6 +454,109 @@ def _emit_hedging_range_result(
         )
     print(
         f"\nTotal: {len(result.per_day)} day(s), "
+        f"{result.num_errors} error(s), "
+        f"${result.total_cost_usd:.4f}"
+    )
+
+
+# ------------------ report-generation (weekly-loop) ------------------
+
+def _add_report_generation_weekly_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--symbol", required=True, help="Stock symbol, e.g. TSLA")
+    parser.add_argument(
+        "--start",
+        required=True,
+        help="Start date YYYY-MM-DD (inclusive). The runner iterates each "
+             "Friday in [start, end]; if start is not a Friday, it advances "
+             "to the next Friday.",
+    )
+    parser.add_argument("--end", required=True, help="End date YYYY-MM-DD (inclusive)")
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="Directory the skill writes the result JSON and Markdown bodies "
+             "into each week (passed to upsert_report.py via --output-root)",
+    )
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Path to the DuckDB file the MCP server reads from",
+    )
+    parser.add_argument("--model", default=None, help="Claude model override")
+    parser.add_argument("--max-turns", type=int, default=30, help="Agent max turns per week")
+    parser.add_argument(
+        "--max-budget",
+        type=float,
+        default=1.0,
+        help="Per-week cost cap in USD (default 1.0)",
+    )
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Stop after the first week that returns an error",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Print assistant and tool events to stderr",
+    )
+    parser.add_argument("--json", action="store_true", help="Print the final result as JSON")
+
+
+def _run_report_generation_from_args(
+    args: argparse.Namespace, callbacks: dict[str, object]
+) -> ReportGenerationRangeResult:
+    try:
+        start = date.fromisoformat(args.start)
+        end = date.fromisoformat(args.end)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid --start/--end (expected YYYY-MM-DD): {exc}")
+
+    if end < start:
+        raise SystemExit(f"--end ({end}) must be >= --start ({start})")
+
+    config = ReportGenerationWeeklyConfig(
+        symbol=args.symbol,
+        start=start,
+        end=end,
+        output_dir=Path(args.output).expanduser().resolve(),
+        db_path=Path(args.db_path).expanduser().resolve(),
+        project_root=DEFAULT_PROJECT_ROOT.resolve(),
+        model=args.model,
+        max_turns=args.max_turns,
+        max_budget_usd=args.max_budget,
+        fail_fast=args.fail_fast,
+    )
+
+    week_callbacks = {
+        "on_week_start": lambda d: print(f"[week] {d} → invoking agent", file=sys.stderr),
+        "on_week_complete": lambda r: print(
+            f"[week] {r.date} {'ERROR' if r.agent_result.is_error else 'OK'} "
+            f"cost=${r.agent_result.cost_usd:.4f} turns={r.agent_result.turns} "
+            f"→ {r.output_path or '(no output file)'}",
+            file=sys.stderr,
+        ),
+    }
+    return run_report_generation_range(config, **callbacks, **week_callbacks)
+
+
+def _emit_report_generation_range_result(
+    result: ReportGenerationRangeResult, *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+
+    print(f"Report-generation range: {result.config.symbol} "
+          f"{result.config.start} → {result.config.end}")
+    for w in result.per_week:
+        status = "ERROR" if w.agent_result.is_error else "OK"
+        dest = str(w.output_path) if w.output_path else "(no output)"
+        print(
+            f"  {w.date}  {status:<5}  ${w.agent_result.cost_usd:.4f}  "
+            f"turns={w.agent_result.turns}  → {dest}"
+        )
+    print(
+        f"\nTotal: {len(result.per_week)} week(s), "
         f"{result.num_errors} error(s), "
         f"${result.total_cost_usd:.4f}"
     )

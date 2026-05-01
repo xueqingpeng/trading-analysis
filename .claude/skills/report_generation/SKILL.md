@@ -42,6 +42,11 @@ beta**, not pure individual-stock alpha:
 | **Beta (relative to sector)** | **5** | **How it moved vs the market** |
 | **Total** | **16** | |
 
+The Section 3 table additionally displays four **context fields**
+(`support_20d`, `resistance_20d`, `volume_ratio`, `cmf_20day`) alongside the
+16 above. They are not part of the analytical core — they are levels and
+participation cues displayed for the technical-synthesis narrative.
+
 ---
 
 ## Inputs
@@ -102,7 +107,7 @@ parameter (e.g. RSI(7) instead of RSI(14)).
 |---|---|
 | `is_trading_day(symbol, target_date)` | Gate the date — checks weekend / holiday / out-of-range in one call. |
 | `get_weekly_metrics(symbol, target_date)` | Return ALL 16 required weekly metrics in one call. **Always use this; never recompute manually.** |
-| `list_news(symbol, date_start, date_end, preview_chars?)` | Scan news in any window as **previews** (`{symbol, date, id, highlights_chars, highlights_preview}`). Default `preview_chars=600`. For the standard weekly scan call `list_news(SYM, TARGET_DATE - 7 days, TARGET_DATE)`; widen the window for 14/30-day catalyst sweeps. |
+| `list_news(symbol, date_start, date_end, preview_chars?)` | Scan news in any window as **previews** (`{symbol, date, id, highlights_chars, highlights_preview}`). Default `preview_chars=600`. **You choose the lookback window** based on what context the week's price action demands: ~7 days for routine weeks, 14/30 days or longer for earnings cycles, M&A, delayed reactions, or multi-week narratives. Compute past dates via `date_offset.py` (see workflow step 3) — do not do date arithmetic in your head. |
 | `get_news_by_id(symbol, id)` | Full article body (`highlights`) for one id. Standard drill-down step after `list_news` for items whose preview looks material. |
 | `list_filings(symbol, date_start, date_end, document_type?)` | Filing metadata (`{date, document_type, mda_chars, risk_chars}`) — no content. Use to find the most recent 10-K / 10-Q on or before `TARGET_DATE` and decide which section is worth reading. |
 | `get_filing_section(symbol, date, document_type, section, offset=0, limit=None)` | Read a specific filing section (`'mda'` or `'risk'`). Pass `limit=2500` for a preview, omit `limit` for full text, or use `offset`/`limit` to paginate long sections. |
@@ -133,20 +138,29 @@ parameter (e.g. RSI(7) instead of RSI(14)).
    `get_weekly_metrics(SYMBOL, TARGET_DATE)`. Save the entire dict; you'll
    reference these values in Sections 1, 2, 3, 6, and 7.
 
-3. **Scan the week's news, then drill down.** Compute
-   `date_start = TARGET_DATE - 7 days` and call
-   `list_news(SYMBOL, date_start, TARGET_DATE)`. This returns **previews**
-   (first 600 chars per item by default) plus `highlights_chars`, not full
-   bodies. Read the previews to pick the items that materially matter for
-   the thesis, then call `get_news_by_id(SYMBOL, id)` for each one whose
-   preview shows it's worth reading in full. For a weekly report it is
-   normal to drill into 2–4 items; pulling every body is wasteful. If 7
-   days is too narrow, widen the window (e.g. 14 or 30 days for a catalyst
-   sweep).
+3. **Scan news, then drill down.** Decide on a lookback window based on
+   what's likely to explain this week's price action: 7 days for a routine
+   week, 14/30 days when an earnings cycle, guidance update, or M&A may
+   be in play, longer when the stock has been driven by a multi-week
+   narrative. There is no fixed default — pick the window that captures
+   the catalysts that actually matter. Compute `date_start` via the
+   bundled helper rather than doing date math yourself:
 
-4. **Find and read the latest filing.** Call
-   `list_filings(SYMBOL, TARGET_DATE - 365 days, TARGET_DATE)` (one year
-   covers a 10-K plus three 10-Qs). Pick the most recent row to get
+   ```bash
+   python3 .claude/skills/report_generation/scripts/date_offset.py TARGET_DATE 7 30
+   ```
+
+   It prints one `<days>\t<YYYY-MM-DD>` line per offset. Then call
+   `list_news(SYMBOL, date_start, TARGET_DATE)`. This returns **previews**
+   (first 600 chars per item by default) plus `highlights_chars`, not
+   full bodies. Read the previews to pick items that materially matter
+   for the thesis, then call `get_news_by_id(SYMBOL, id)` for each one
+   whose preview shows it's worth reading in full. For a weekly report
+   it is normal to drill into 2–4 items; pulling every body is wasteful.
+
+4. **Find and read the latest filing.** Compute `date_start = TARGET_DATE
+   - 365 days` via `date_offset.py` (one year covers a 10-K plus three
+   10-Qs) and call `list_filings(SYMBOL, date_start, TARGET_DATE)`. Pick the most recent row to get
    `(filing_date, document_type, mda_chars, risk_chars)`. Then call
    `get_filing_section(SYMBOL, filing_date, document_type, 'mda', limit=2500)`
    for the MD&A preview and another with `section='risk'` for Risk
@@ -206,10 +220,17 @@ note this limitation in Section 6 of those reports.
 | `correlation_60d` | 60-day rolling correlation between symbol's daily returns and basket's daily returns. High (>0.7) = moves with the sector; low (<0.4) = idiosyncratic |
 | `beta_60d` | 60-day rolling beta = `cov(symbol_returns, basket_returns) / var(basket_returns)`. **β > 1 = amplifies the sector**; β < 1 = dampened; β ≈ 0 = unrelated |
 
-### Context fields (returned by `get_weekly_metrics`, not in the table)
+### Context fields (returned by `get_weekly_metrics`, not part of the 16)
+
+The first four are **displayed in the Section 3 table** alongside the 16
+core metrics — the remainder are returned for prose / thesis use only.
 
 | Key | Use |
 |---|---|
+| `support_20d` | Lowest `low` over the trailing 20 trading days. Displayed as the near-term support reference. |
+| `resistance_20d` | Highest `high` over the trailing 20 trading days. Displayed as the near-term resistance reference. |
+| `volume_ratio` | This week's avg daily volume / trailing-20-day avg volume. `>1` = above-average activity; `<1` = quiet week. Displayed in Momentum & Volume row. |
+| `cmf_20day` | Chaikin Money Flow over the trailing 20 trading days. Positive = net buying pressure; negative = net selling. Displayed in Momentum & Volume row. |
 | `ma_5day` | Used internally for `momentum_short`; available for thesis prose if helpful |
 | `macd_values` | `{line, signal, hist}` raw MACD numerics |
 | `rsi_class` | The bucketed RSI label, see above |
@@ -272,6 +293,19 @@ State the rating using exactly one of:
 
 - `STRONG_BUY`, `BUY`, `HOLD`, `SELL`, `STRONG_SELL`
 
+**Rating philosophy.** The rating is your call to the reader — the part of
+the report that converts a week's evidence into a usable signal. Make the
+call your overall analysis supports: when the alpha, momentum, beta, and
+news blocks point the same way, the rating should reflect that, not retreat
+to a neutral default. A HOLD on a week whose prose already reads clearly
+bearish (or bullish) is a low-value outcome — the reader could already see
+the lean from the text and is looking to you for the call. Reserve HOLD for
+weeks where the evidence is **genuinely mixed**: bull and bear cases of
+similar weight, conflicting signals across blocks, or no near-term catalyst
+to break the tie. You don't need to manufacture conviction you don't have,
+but you also shouldn't understate the conviction you do have. Pick the
+rating that an investor reading only the rating would benefit from.
+
 Then provide **2–3 distinct, evidence-based thesis bullets**, each grounded
 in a specific metric, news item, or filing passage. For a weekly report, at
 least one bullet should explicitly reference the **relative-to-sector**
@@ -282,7 +316,9 @@ despite a market-wide sell-off"*) — unless the symbol has no benchmark.
 
 ### 3. Weekly Price Performance & Technical Indicators
 
-Present all 16 metrics in a structured Markdown table. See template below.
+Present all 16 metrics — plus the four context fields (`support_20d`,
+`resistance_20d`, `volume_ratio`, `cmf_20day`) for technical synthesis —
+in a structured Markdown table. See template below.
 
 If the symbol's `benchmark_basket` is empty, write `N/A (no peers in
 current dataset)` for all 5 beta-block rows.
@@ -361,6 +397,7 @@ python3 .claude/skills/report_generation/scripts/upsert_report.py \
     --symbol TSLA \
     --target-date 2025-03-07 \
     --action BUY \
+    --price 238.03 \
     --model claude-sonnet-4-6 \
     --output-root <whatever the caller specified, e.g. /io/slot1> \
     <<'REPORT'
@@ -374,6 +411,7 @@ REPORT
 | `--symbol`      | Ticker symbol |
 | `--target-date` | Week-ending date in `YYYY-MM-DD` |
 | `--action`      | One of the five allowed rating tokens |
+| `--price`       | **Required.** The week-close price — pass `week_close` from the `get_weekly_metrics` dict you pulled in step 2. Omitting it leaves the field as the sentinel `0.0`, which downstream consumers will treat as missing data. |
 | `--model`       | Actual model identifier used in filenames |
 | `--output-root` | **Pass the value the caller specified in the invocation** (e.g. `/io/slot1`). Falls back to `results/report_generation` (relative to cwd) only if no value was given — that default is rarely writable inside a sandbox, so omitting it usually causes a `PermissionError`. |
 
@@ -552,7 +590,7 @@ positive catalyst from news / filings.
 - Do not predict specific future prices.
 - If `benchmark_basket` comes back empty, do not invent a sector benchmark;
   state the limitation in Section 6.
-- - On Windows, never use bash heredoc (cat << EOF). Never create temporary Python scripts to query the database. All data must come from MCP tools only.
+- On Windows, never use bash heredoc (cat << EOF). Never create temporary Python scripts to query the database. All data must come from MCP tools only.
 
 ---
 

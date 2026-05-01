@@ -20,6 +20,12 @@ from .hedging_daily import (
     HedgingRangeResult,
     run_hedging_range,
 )
+from .report_generation_weekly import (
+    ReportGenerationRangeResult,
+    ReportGenerationWeeklyConfig,
+    WeeklyResult,
+    run_report_generation_range,
+)
 from .auditing_runner import (
     AuditingBatchConfig,
     AuditingBatchResult,
@@ -46,6 +52,10 @@ __all__ = [
     "HedgingDailyConfig",
     "HedgingRangeResult",
     "run_hedging_range",
+    "ReportGenerationWeeklyConfig",
+    "ReportGenerationRangeResult",
+    "WeeklyResult",
+    "run_report_generation_range",
     "AuditingConfig",
     "AuditingResult",
     "AuditingBatchConfig",

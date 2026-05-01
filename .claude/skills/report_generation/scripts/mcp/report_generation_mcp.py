@@ -8,7 +8,8 @@ performed by the agent itself.
 
 This server is purpose-built for WEEKLY equity research reports. The agent
 is expected to call get_weekly_metrics ONCE per report, getting all 16
-required metrics in a single call (11 alpha/momentum + 5 beta block).
+required metrics in a single call (8 alpha + 3 momentum + 5 beta) plus
+context extras (support/resistance/volume/CMF) used in the Section 3 table.
 """
 
 import argparse
@@ -512,11 +513,12 @@ def _classify_rsi(rsi_value: float) -> str:
         "Momentum block (3): momentum_short, macd_signal, rsi_14\n"
         "Beta block (5): sector_basket_return_1w_pct, relative_return_1w_pct,\n"
         "                relative_return_4w_pct, correlation_60d, beta_60d\n\n"
-        "Context extras (not in the 16):\n"
+        "Context extras (not in the 16, but the first 4 are displayed alongside):\n"
         "  support_20d       — lowest low over trailing 20 trading days (support level)\n"
         "  resistance_20d    — highest high over trailing 20 trading days (resistance level)\n"
         "  cmf_20day         — Chaikin Money Flow over trailing 20 trading days\n"
-        "  volume_ratio, ma_5day, ma_60day, week_high, week_low,\n"
+        "  volume_ratio      — this week's avg volume / trailing-20-day avg volume\n"
+        "  ma_5day, ma_60day, week_high, week_low,\n"
         "  dist_from_52w_low_pct, macd_values, rsi_class, week_trading_days, benchmark_basket"
     )
 )
@@ -555,10 +557,10 @@ def get_weekly_metrics(
         raise ValueError(f"No trading days found in the week ending {target_date} for {symbol}.")
 
     # ---- Price block ----
-    week_open = float(this_week.iloc[0]["open"])
-    week_close = float(this_week.iloc[-1]["adj_close"])
-    week_high = float(this_week["high"].max())
-    week_low = float(this_week["low"].min())
+    week_open = round(float(this_week.iloc[0]["open"]), 4)
+    week_close = round(float(this_week.iloc[-1]["adj_close"]), 4)
+    week_high = round(float(this_week["high"].max()), 4)
+    week_low = round(float(this_week["low"].min()), 4)
 
     # ---- Returns block ----
     pre_week = df[~this_week_mask & (df_dates < week_start_dt)]
@@ -680,16 +682,16 @@ def get_weekly_metrics(
         "relative_return_4w_pct": beta_block["relative_return_4w_pct"],
         "correlation_60d": beta_block["correlation_60d"],
         "beta_60d": beta_block["beta_60d"],
-        # Context extras
+        # Context extras (not in the 16; the first 4 are displayed in Section 3)
         "support_20d": support_20d,
         "resistance_20d": resistance_20d,
+        "volume_ratio": volume_ratio,
         "cmf_20day": cmf_20day,
         "week_high": week_high,
         "week_low": week_low,
         "ma_5day": ma_5day,
         "ma_60day": ma_60day,
         "dist_from_52w_low_pct": dist_from_52w_low_pct,
-        "volume_ratio": volume_ratio,
         "macd_values": macd_values,
         "rsi_class": rsi_class,
         "week_trading_days": int(len(this_week)),
