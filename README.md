@@ -21,7 +21,7 @@ export ANTHROPIC_API_KEY=sk-xxx                         # any provider key
 export CLAUDE_MODEL=gpt-5.4                             # or claude-sonnet-4-6, etc.
 
 ./run_docker.sh trading --verbose \
-    --symbol TSLA --start 2025-03-03 --end 2025-03-31 \
+    --symbol TSLA --start 2026-01-02 --end 2026-03-31 \
     --db-path ./env.duckdb \
     --output  ./results/trading
 ```
@@ -68,13 +68,13 @@ Model resolution order: CLI `--model` > `CLAUDE_MODEL` env > default `claude-son
 ```bash
 # trading — daily-loop skill over a date range, queries DuckDB via MCP
 python run_benchmark.py trading \
-    --symbol TSLA --start 2025-03-03 --end 2025-03-31 \
+    --symbol TSLA --start 2026-01-02 --end 2026-03-31 \
     --db-path  ./env.duckdb \
     --output   /path/to/results/trading
 
 # report-generation — weekly-loop skill over a date range, queries DuckDB via MCP
 python run_benchmark.py report-generation \
-    --symbol TSLA --start 2025-01-01 --end 2025-03-31 \
+    --symbol TSLA --start 2026-01-02 --end 2026-03-31 \
     --db-path ./env.duckdb \
     --output  /path/to/results/report_generation
 
@@ -144,7 +144,7 @@ export ANTHROPIC_API_KEY=sk-xxx
 export CLAUDE_MODEL=gpt-5.4                 # or claude-sonnet-4-6, gpt-4.1, etc.
 
 ./run_docker.sh trading --verbose \
-    --symbol TSLA --start 2025-03-03 --end 2025-03-31 \
+    --symbol TSLA --start 2026-01-02 --end 2026-03-31 \
     --db-path ./env.duckdb \
     --output  ./results/trading
 ```
@@ -218,7 +218,7 @@ The five skills below show both forms. The raw prompts are the verbatim strings 
 
 ```bash
 ./run_docker.sh trading --verbose \
-    --symbol TSLA --start 2025-03-03 --end 2025-03-31 \
+    --symbol TSLA --start 2026-01-02 --end 2026-03-31 \
     --db-path ./env.duckdb \
     --output  ./results/trading
 ```
@@ -226,7 +226,7 @@ The five skills below show both forms. The raw prompts are the verbatim strings 
 **Raw prompt sent to the agent for ONE day:**
 
 ```
-Trade TSLA on 2025-03-05.
+Trade TSLA on 2026-01-02.
 
 Your turn is NOT complete unless you have actually invoked the Bash tool to run
 `python3 .claude/skills/trading/scripts/upsert_decision.py` with all required
@@ -247,7 +247,7 @@ When calling upsert_decision.py, pass --output-root=/io/slot1 and
 
 ```bash
 ./run_docker.sh hedging --verbose \
-    --start 2025-03-03 --end 2025-05-31 \
+    --start 2026-01-02 --end 2026-03-31 \
     --db-path ./env.duckdb \
     --output  ./results/hedging
 ```
@@ -255,7 +255,7 @@ When calling upsert_decision.py, pass --output-root=/io/slot1 and
 **Raw prompt — first day (IS_FIRST_DAY=True):**
 
 ```
-Start hedging on 2025-03-03 with IS_FIRST_DAY=True.
+Start hedging on 2026-01-02 with IS_FIRST_DAY=True.
 
 Your turn is NOT complete unless you have actually invoked the Bash tool to run
 `python3 .claude/skills/hedging/scripts/upsert_hedging_decision.py` with all
@@ -271,7 +271,7 @@ When calling upsert_hedging_decision.py, pass --output-root=/io/slot1 and
 **Raw prompt — subsequent days (IS_FIRST_DAY=False, the default):**
 
 ```
-Run hedging for 2025-03-04 with IS_FIRST_DAY=False.
+Run hedging for 2026-01-05 with IS_FIRST_DAY=False.
 
 [same trailing Bash + --output-root + --model clauses as above, with
 upsert_hedging_decision.py]
@@ -332,7 +332,7 @@ exactly as given (do not substitute your own model name).
 
 ```bash
 ./run_docker.sh report-generation --verbose \
-    --symbol TSLA --start 2025-01-01 --end 2025-03-31 \
+    --symbol TSLA --start 2026-01-02 --end 2026-03-31 \
     --db-path ./env.duckdb \
     --output  ./results/report_generation
 ```
@@ -342,7 +342,7 @@ The runner iterates each **Friday** in `[start, end]`. If `--start` is not a Fri
 **Raw prompt sent to the agent for ONE Friday:**
 
 ```
-Generate the weekly equity research report for TSLA for the week ending 2025-03-07.
+Generate the weekly equity research report for TSLA for the week ending 2026-01-02.
 
 Your turn is NOT complete unless you have actually invoked the Bash tool to run
 `python3 .claude/skills/report_generation/scripts/upsert_report.py` with all
@@ -352,7 +352,7 @@ will not exist on disk. Do not stop, do not write a summary, do not say the
 report has been written until the Bash call has returned its one-line JSON
 success summary.
 
-When calling upsert_report.py, pass --symbol=TSLA --target-date=2025-03-07
+When calling upsert_report.py, pass --symbol=TSLA --target-date=2026-01-02
 --output-root=/io/slot1 and --model=gpt-5.4 exactly as given (do not substitute
 your own model name).
 ```
@@ -414,8 +414,8 @@ from claude_agent_trading import (
 result = run_report_generation_range(
     ReportGenerationWeeklyConfig(
         symbol="TSLA",
-        start=date(2025, 1, 1),
-        end=date(2025, 3, 31),
+        start=date(2026, 1, 2),
+        end=date(2026, 3, 31),
         output_dir=Path("./results/report_generation").resolve(),
         db_path=Path("./env.duckdb").resolve(),
     )
