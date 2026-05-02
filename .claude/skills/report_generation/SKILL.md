@@ -325,7 +325,7 @@ current dataset)` for all 5 beta-block rows.
 
 **Important:** Immediately below the table, write a brief "Technical Synthesis" paragraph (2–3 sentences). Interpret the relationship between volume, moving averages, and momentum. Note any obvious support/resistance levels or volume divergences (e.g., high-volume selling vs low-volume drift).
 
-### 4. Market Sentiment
+### 4. News & Catalysts
 
 First, assign a **Sentiment Thermometer** tag (one of: Euphoric, Cautiously Optimistic, Mixed, Defensive, Panic) summarizing the overall news tone for the week.
 
@@ -492,7 +492,7 @@ Use this Markdown template exactly. Replace `{...}` with computed values.
 
 ---
 
-### 4. Market Sentiment
+### 4. News & Catalysts
 
 **Sentiment Thermometer:** [ Euphoric | Cautiously Optimistic | Mixed | Defensive | Panic ]
 
