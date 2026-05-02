@@ -372,7 +372,7 @@ correction applies.
 the write step, and do NOT generate the JSON yourself.
 
 ```bash
-python3 .claude/skills/auditing/scripts/write_audit.py \
+python .claude/skills/auditing/scripts/write_audit.py \
     --filing-name 10k --ticker rrr --issue-time 20231231 \
     --concept-id us-gaap:AssetsCurrent \
     --period "FY2023" \
@@ -495,7 +495,7 @@ the output file must still contain exactly one JSON line.
    in Step 5 Case B), then `calculated_value = abs(...)`. Do not look
    for reasons why a negative value is "fine" — that is the filing error
    this audit is designed to catch.
-7. Run `python3 .claude/skills/auditing/scripts/write_audit.py` via Bash
+7. Run `python .claude/skills/auditing/scripts/write_audit.py` via Bash
    with the eight required flags (`--filing-name`, `--ticker`,
    `--issue-time`, `--concept-id`, `--period`, `--model`,
    `--extracted-value`, `--calculated-value`). Do not write inline Python.

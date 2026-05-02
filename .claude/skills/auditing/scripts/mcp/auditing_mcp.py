@@ -10,7 +10,7 @@ and balance/period-type metadata. Writing the final audit JSON is handled by
 the sibling `write_audit.py` CLI script — this server only does reads.
 
 Run:
-    python3 auditing_mcp.py --data-root=/abs/path/to/data/auditing
+    pythonauditing_mcp.py --data-root=/abs/path/to/data/auditing
 """
 
 from __future__ import annotations

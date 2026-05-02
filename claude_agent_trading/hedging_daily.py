@@ -89,7 +89,7 @@ def build_daily_prompt(
     return (
         f"{verb} {target_date} with IS_FIRST_DAY={flag}.\n\n"
         f"Your turn is NOT complete unless you have actually invoked the "
-        f"Bash tool to run `python3 .claude/skills/hedging/scripts/"
+        f"Bash tool to run `python .claude/skills/hedging/scripts/"
         f"upsert_hedging_decision.py` with all required flags. A text-only "
         f"response that merely describes or announces the decision is a "
         f"FAILURE — the result file will not exist on disk. Do not stop, "

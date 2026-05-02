@@ -7,7 +7,7 @@ sanitization, upsert by date, sorting, date-bound recomputation, and JSON
 writing.
 
 Usage:
-    python3 .claude/skills/hedging/scripts/upsert_hedging_decision.py \
+    python.claude/skills/hedging/scripts/upsert_hedging_decision.py \
         --left META --right MSFT --target-date 2025-03-03 \
         --left-price 182.45 --right-price 401.12 \
         --action LONG_SHORT --model gpt-5 \

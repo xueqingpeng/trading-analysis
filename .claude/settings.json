@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "trading_mcp": {
+      "command": "python",
+      "args": [".claude/skills/trading/scripts/mcp/trading_mcp.py"],
+      "env": {
+        "TRADING_DB_PATH": "./env.duckdb"
+      }
+    }
+  }
+}

@@ -95,11 +95,11 @@ of full news highlights or filing bodies can exceed the model context.
 Use helper scripts via Bash instead of writing inline Python:
 
 ```bash
-python3 .claude/skills/hedging/scripts/date_offset.py TARGET_DATE 7 30 60 365
+python .claude/skills/hedging/scripts/date_offset.py TARGET_DATE 7 30 60 365
 ```
 
 ```bash
-python3 .claude/skills/hedging/scripts/upsert_hedging_decision.py \
+python .claude/skills/hedging/scripts/upsert_hedging_decision.py \
     --left META --right MSFT --target-date 2025-03-03 \
     --left-price 182.45 --right-price 401.12 \
     --action LONG_SHORT \

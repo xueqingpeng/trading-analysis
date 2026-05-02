@@ -130,7 +130,7 @@ This keeps the decision valid under any data population policy.
    recompute-bounds / write. Don't write JSON yourself. Example:
 
    ```bash
-   python3 .claude/skills/trading/scripts/upsert_decision.py \
+   python .claude/skills/trading/scripts/upsert_decision.py \
        --symbol SYMBOL --target-date TARGET_DATE \
        --price PRICE_TODAY --action <BUY|SELL|HOLD> \
        --model <your model id> \
@@ -144,7 +144,7 @@ Compute date offsets with the bundled helper — one call covers every offset
 you need for the day:
 
 ```bash
-python3 .claude/skills/trading/scripts/date_offset.py TARGET_DATE 7 30 60 365
+python .claude/skills/trading/scripts/date_offset.py TARGET_DATE 7 30 60 365
 ```
 
 Prints one `<days>\t<YYYY-MM-DD>` line per offset, in argument order. Do not
@@ -195,7 +195,7 @@ record by `target_date`, sorts, recomputes `start_date`/`end_date`, writes.
 ### How to call it
 
 ```bash
-python3 .claude/skills/trading/scripts/upsert_decision.py \
+python .claude/skills/trading/scripts/upsert_decision.py \
     --symbol TSLA \
     --target-date 2025-03-03 \
     --price 284.65 \
@@ -280,7 +280,7 @@ date's record (lets the caller re-run one day).
    | 'ma' | 'bbands')` with a window you choose (e.g. 30 / 60 / 120 trading
    days) if a technical signal helps.
 6. Decide `action` based on the data you actually fetched.
-7. Run `python3 .claude/skills/trading/scripts/upsert_decision.py` via the
+7. Run `python .claude/skills/trading/scripts/upsert_decision.py` via the
    Bash tool with the 5 required flags. Don't write inline Python.
 
 One record in, one record out. The caller decides when to mark `status` as

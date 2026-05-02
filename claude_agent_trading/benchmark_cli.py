@@ -534,6 +534,11 @@ def _add_auditing_args(parser: argparse.ArgumentParser) -> None:
              "output file is already present (resume an interrupted batch).",
     )
     parser.add_argument(
+        "--workers", type=int, default=1,
+        help="(batch mode only) Number of parallel worker threads (default 1). "
+             "Tasks are independent so 10-15 workers is safe with a paid API.",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Print assistant and tool events to stderr",
     )
@@ -624,6 +629,7 @@ def _run_auditing_batch_from_args(
         max_budget_usd=args.max_budget,
         fail_fast=args.fail_fast,
         resume=not args.no_resume,
+        workers=args.workers,
     )
 
     def _format_complete(r: AuditingTaskResult) -> str:

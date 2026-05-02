@@ -66,7 +66,25 @@ def resolve_provider_env(model: str | None = None) -> dict[str, str]:
                 env[k] = v
         return env
 
-    # --- Direct API mode ---
+    # --- OpenAI model via local proxy ---
+    # Models starting with gpt- / o1 / o3 / o4 route through claude_proxy/proxy.py
+    # which translates Anthropic API format → OpenAI chat/completions.
+    # The proxy auto-detects the provider from the key prefix (sk- → openai).
+    _openai_prefixes = ("gpt-", "o1", "o3", "o4-", "text-davinci")
+    if effective_model and any(effective_model.startswith(p) for p in _openai_prefixes):
+        openai_key = os.environ.get("OPENAI_API_KEY")
+        if openai_key:
+            proxy_url = os.environ.get("ANTHROPIC_BASE_URL", "http://127.0.0.1:18080")
+            env["ANTHROPIC_API_KEY"] = openai_key
+            env["ANTHROPIC_BASE_URL"] = proxy_url
+            return env
+        raise RuntimeError(
+            "OpenAI model requested but OPENAI_API_KEY not set.\n"
+            "Add OPENAI_API_KEY=sk-... to your .env file.\n"
+            "Also make sure the proxy is running: python claude_proxy/proxy.py"
+        )
+
+    # --- Direct Anthropic API mode ---
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if api_key:
         env["ANTHROPIC_API_KEY"] = api_key
@@ -76,5 +94,6 @@ def resolve_provider_env(model: str | None = None) -> dict[str, str]:
         "No Claude API credentials found. Set either:\n"
         "  Azure Foundry: ANTHROPIC_FOUNDRY_RESOURCE, ANTHROPIC_FOUNDRY_API_KEY, CLAUDE_CODE_USE_FOUNDRY=1\n"
         "  Direct API:    ANTHROPIC_API_KEY\n"
+        "  OpenAI model:  OPENAI_API_KEY (requires proxy: python claude_proxy/proxy.py)\n"
         "You can put these in .env at the project root."
     )

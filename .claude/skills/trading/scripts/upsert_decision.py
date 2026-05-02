@@ -7,7 +7,7 @@ lookups; this script owns the file-I/O side (load-or-create, sanitize
 filename, upsert by date, sort, recompute start/end, write).
 
 Usage:
-    python3 .claude/skills/trading/scripts/upsert_decision.py \
+    python.claude/skills/trading/scripts/upsert_decision.py \
         --symbol TSLA --target-date 2025-03-03 \
         --price 284.65 --action BUY \
         --model claude-sonnet-4-6

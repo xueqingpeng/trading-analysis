@@ -7,7 +7,7 @@ lookups; this script owns the file-I/O side (sanitize filename, ensure
 output dir, write the JSON line).
 
 Usage:
-    python3 .claude/skills/auditing/scripts/write_audit.py \
+    python.claude/skills/auditing/scripts/write_audit.py \
         --filing-name 10k --ticker rrr --issue-time 20231231 \
         --concept-id us-gaap:AssetsCurrent --period FY2023 \
         --model claude-sonnet-4-6 \

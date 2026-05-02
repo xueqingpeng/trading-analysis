@@ -10,3 +10,4 @@ fastapi>=0.104.0
 uvicorn>=0.24.0
 httpx>=0.25.0
 pyarrow>=15.0
+tqdm>=4.66

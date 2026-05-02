@@ -2,14 +2,14 @@
 """Print one or more past-date offsets from a target date.
 
 Usage:
-    python3 date_offset.py TARGET_DATE DAYS [DAYS ...]
+    pythondate_offset.py TARGET_DATE DAYS [DAYS ...]
 
 TARGET_DATE is YYYY-MM-DD. Each DAYS is a non-negative integer: the script
 prints `TARGET_DATE - timedelta(days=DAYS)` on its own line, in the same
 order as the arguments, formatted as `<days>\\t<YYYY-MM-DD>`.
 
 Example:
-    $ python3 .claude/skills/trading/scripts/date_offset.py 2025-03-26 7 30 365
+    $ python.claude/skills/trading/scripts/date_offset.py 2025-03-26 7 30 365
     7	2025-03-19
     30	2025-02-24
     365	2024-03-26

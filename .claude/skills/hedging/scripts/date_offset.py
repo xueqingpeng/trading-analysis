@@ -2,7 +2,7 @@
 """Print one or more past-date offsets from a target date.
 
 Usage:
-    python3 .claude/skills/hedging/scripts/date_offset.py TARGET_DATE DAYS [DAYS ...]
+    python.claude/skills/hedging/scripts/date_offset.py TARGET_DATE DAYS [DAYS ...]
 
 Each DAYS value is a non-negative integer. Output is one line per offset in
 the same order as the arguments, formatted as `<days>\t<YYYY-MM-DD>`.

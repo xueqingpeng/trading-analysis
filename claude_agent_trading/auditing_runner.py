@@ -21,10 +21,14 @@ import json
 import logging
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+from tqdm import tqdm
 
 from .benchmark import DEFAULT_PROJECT_ROOT
 from .core import AgentResult, run_agent
@@ -103,7 +107,7 @@ def _audit_run_clauses(model: str, output_root: Path) -> str:
     """
     return (
         "\n\nYour turn is NOT complete unless you have actually invoked the "
-        "Bash tool to run `python3 .claude/skills/auditing/scripts/"
+        "Bash tool to run `python .claude/skills/auditing/scripts/"
         "write_audit.py` with all required flags. A text-only response "
         "that merely describes the audit is a FAILURE — the result file "
         "will not exist on disk. Do not stop, do not write a summary, do "
@@ -355,6 +359,7 @@ class AuditingBatchConfig:
     max_budget_usd: float = 5.0
     fail_fast: bool = False
     resume: bool = True
+    workers: int = 1
 
 
 @dataclass(slots=True)
@@ -565,20 +570,24 @@ def run_auditing_batch(
             f"(file is empty or all lines are blank)."
         )
 
-    per_task: list[AuditingTaskResult] = []
-    total_cost = 0.0
-    num_errors = 0
-    num_skipped = 0
+    # Run log — one file per batch invocation, written to output_root.
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log_path = output_root / f"run_auditing_{ts}.log"
+    log_file = log_path.open("w", buffering=1, encoding="utf-8")
+    log_lock = threading.Lock()
+    log_file.write(
+        f"# auditing batch  tasks_file={config.tasks_file}  "
+        f"model={resolved_model}  workers={config.workers}\n"
+        f"# started {datetime.now(timezone.utc).isoformat()}\n\n"
+    )
 
-    # Track output files between tasks so we can attribute new files.
-    files_seen = {p.name for p in output_root.glob("*.json")}
+    stop_event = threading.Event()
 
-    for idx, (raw_prompt, case_id) in enumerate(cases, start=1):
+    def _run_one(idx: int, raw_prompt: str, case_id: str | None) -> AuditingTaskResult:
         label = case_id or f"task_{idx}"
-
-        # Resume guard: if we can predict this task's output filename and
-        # it already exists, skip without burning API cost.
         full_prompt = raw_prompt + _audit_run_clauses(resolved_model, output_root)
+
+        # Resume guard — predict the output filename deterministically.
         if config.resume:
             fields = _parse_audit_prompt(raw_prompt)
             if fields is not None:
@@ -591,12 +600,28 @@ def run_auditing_batch(
                         output_path=expected,
                         skipped=True,
                     )
-                    per_task.append(skip)
-                    num_skipped += 1
+                    with log_lock:
+                        log_file.write(f"[task] {label}  SKIP (resume)  → {expected}\n")
+                        log_file.flush()
                     if on_task_complete:
                         on_task_complete(skip)
-                    files_seen.add(expected.name)
-                    continue
+                    return skip
+
+        if stop_event.is_set():
+            # fail-fast triggered by another worker — return a placeholder error.
+            return AuditingTaskResult(
+                case_id=case_id,
+                prompt=full_prompt,
+                agent_result=AgentResult(
+                    result="aborted (fail-fast)",
+                    cost_usd=0.0,
+                    turns=0,
+                    duration_ms=0,
+                    session_id="",
+                    is_error=True,
+                ),
+                output_path=None,
+            )
 
         if on_task_start:
             on_task_start(label)
@@ -615,14 +640,13 @@ def run_auditing_batch(
             on_stderr=on_stderr,
         )
 
-        # Best-effort output detection: any new *.json file in output_root
-        # since the previous task is attributed to this task.
-        files_now = {p.name for p in output_root.glob("*.json")}
-        new_files = files_now - files_seen
-        files_seen = files_now
+        # Output path: use the deterministic predicted path; fall back to None.
         output_path: Path | None = None
-        if len(new_files) == 1:
-            output_path = output_root / next(iter(new_files))
+        fields = _parse_audit_prompt(raw_prompt)
+        if fields is not None:
+            predicted = _expected_output_path(fields, resolved_model, output_root)
+            if predicted.is_file():
+                output_path = predicted
 
         task = AuditingTaskResult(
             case_id=case_id,
@@ -630,17 +654,65 @@ def run_auditing_batch(
             agent_result=agent_result,
             output_path=output_path,
         )
-        per_task.append(task)
-        total_cost += agent_result.cost_usd
-        if agent_result.is_error:
-            num_errors += 1
+
+        with log_lock:
+            log_file.write(
+                f"[task] {label}  "
+                f"{'ERROR' if agent_result.is_error else 'OK'}  "
+                f"cost=${agent_result.cost_usd:.4f}  turns={agent_result.turns}  "
+                f"→ {output_path or '(no output file)'}\n"
+            )
+            log_file.flush()
 
         if on_task_complete:
             on_task_complete(task)
 
         if config.fail_fast and agent_result.is_error:
             logger.warning("fail-fast: stopping after error on %s", label)
-            break
+            stop_event.set()
+
+        return task
+
+    # Submit all tasks; results are collected in input order.
+    per_task: list[AuditingTaskResult] = [None] * len(cases)  # type: ignore[list-item]
+    total_cost = 0.0
+    num_errors = 0
+    num_skipped = 0
+
+    with ThreadPoolExecutor(max_workers=config.workers) as executor:
+        future_to_idx = {
+            executor.submit(_run_one, idx, raw_prompt, case_id): idx - 1
+            for idx, (raw_prompt, case_id) in enumerate(cases, start=1)
+        }
+        with tqdm(
+            total=len(cases),
+            desc="auditing",
+            unit="task",
+            dynamic_ncols=True,
+        ) as pbar:
+            for future in as_completed(future_to_idx):
+                slot = future_to_idx[future]
+                result = future.result()
+                per_task[slot] = result
+                if result.skipped:
+                    num_skipped += 1
+                    pbar.set_postfix(ok=len(cases) - num_errors - num_skipped, err=num_errors, skip=num_skipped)
+                elif result.agent_result and result.agent_result.is_error:
+                    num_errors += 1
+                    total_cost += result.agent_result.cost_usd
+                    pbar.set_postfix(ok=len(cases) - num_errors - num_skipped, err=num_errors, skip=num_skipped)
+                elif result.agent_result:
+                    total_cost += result.agent_result.cost_usd
+                    pbar.set_postfix(ok=len(cases) - num_errors - num_skipped, err=num_errors, skip=num_skipped)
+                pbar.update(1)
+
+    with log_lock:
+        log_file.write(
+            f"\n# finished {datetime.now(timezone.utc).isoformat()}  "
+            f"total_cost=${total_cost:.4f}  errors={num_errors}  skipped={num_skipped}\n"
+        )
+        log_file.close()
+    logger.info("run log written to %s", log_path)
 
     return AuditingBatchResult(
         config=config,

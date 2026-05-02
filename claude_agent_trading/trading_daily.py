@@ -13,8 +13,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from dataclasses import asdict, dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -98,7 +99,7 @@ def build_daily_prompt(
     return (
         f"Trade {symbol} on {target_date}.\n\n"
         f"Your turn is NOT complete unless you have actually invoked the "
-        f"Bash tool to run `python3 .claude/skills/trading/scripts/"
+        f"Bash tool to run `python .claude/skills/trading/scripts/"
         f"upsert_decision.py` with all required flags. A text-only response "
         f"that merely describes or announces the decision is a FAILURE — "
         f"the result file will not exist on disk. Do not stop, do not write "
@@ -144,6 +145,25 @@ def run_trading_range(
     mcp_servers = _load_mcp_servers(config.project_root, db_path_abs)
     resolved_model = config.model or resolve_model()
     output_dir_abs = config.output_dir.resolve()
+    output_dir_abs.mkdir(parents=True, exist_ok=True)
+
+    # Resume: load dates already written to disk so we can skip them.
+    completed_dates = _load_completed_dates(output_dir_abs, config.symbol)
+    if completed_dates:
+        logger.info(
+            "resume: %d date(s) already in output file — skipping them",
+            len(completed_dates),
+        )
+
+    # Run log: append every day's outcome to a persistent log file.
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log_path = output_dir_abs / f"run_{config.symbol}_{ts}.log"
+    log_file = log_path.open("w", buffering=1, encoding="utf-8")
+    log_file.write(
+        f"# trading run  symbol={config.symbol}  "
+        f"start={config.start}  end={config.end}  model={resolved_model}\n"
+        f"# started {datetime.now(timezone.utc).isoformat()}\n\n"
+    )
 
     per_day: list[DailyResult] = []
     total_cost = 0.0
@@ -153,6 +173,13 @@ def run_trading_range(
         config.start, config.end, skip_weekends=config.skip_weekends
     ):
         target_date = d.isoformat()
+
+        # Auto-resume: skip dates already successfully recorded.
+        if target_date in completed_dates:
+            logger.info("[day] %s SKIP (resume)", target_date)
+            log_file.write(f"[day] {target_date}  SKIP (resume)\n")
+            continue
+
         if on_day_start:
             on_day_start(target_date)
 
@@ -182,6 +209,16 @@ def run_trading_range(
         total_cost += agent_result.cost_usd
         if agent_result.is_error:
             num_errors += 1
+            # On success, add to completed so a same-process retry won't re-run.
+        else:
+            completed_dates.add(target_date)
+
+        log_file.write(
+            f"[day] {target_date}  "
+            f"{'ERROR' if agent_result.is_error else 'OK'}  "
+            f"cost=${agent_result.cost_usd:.4f}  turns={agent_result.turns}\n"
+        )
+        log_file.flush()
 
         if on_day_complete:
             on_day_complete(day_result)
@@ -189,6 +226,13 @@ def run_trading_range(
         if config.fail_fast and agent_result.is_error:
             logger.warning("fail-fast: stopping after error on %s", target_date)
             break
+
+    log_file.write(
+        f"\n# finished {datetime.now(timezone.utc).isoformat()}  "
+        f"total_cost=${total_cost:.4f}  errors={num_errors}\n"
+    )
+    log_file.close()
+    logger.info("run log written to %s", log_path)
 
     return TradingRangeResult(
         config=config,
@@ -299,7 +343,7 @@ def _check_mcp_server_importable(project_root: Path) -> None:
             [sys.executable, "-c", probe],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=60,
             cwd=str(project_root),
         )
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
@@ -314,6 +358,19 @@ def _check_mcp_server_importable(project_root: Path) -> None:
             f"Probe stderr:\n{result.stderr.strip()}\n\n"
             f"Fix: pip install -r {project_root / 'requirements.txt'}"
         )
+
+
+def _load_completed_dates(output_dir: Path, symbol: str) -> set[str]:
+    """Return the set of dates already recorded in the output JSON."""
+    candidates = list(output_dir.glob(f"trading_{symbol}_*.json")) if output_dir.is_dir() else []
+    if not candidates:
+        return set()
+    out_file = max(candidates, key=lambda p: p.stat().st_mtime)
+    try:
+        doc = json.loads(out_file.read_text())
+        return {r["date"] for r in doc.get("recommendations", []) if "date" in r}
+    except Exception:
+        return set()
 
 
 def _find_output_file(output_dir: Path, symbol: str) -> Path | None:
