@@ -472,6 +472,8 @@ trading-analysis/
 
 ## openclaw harness + demo
 
+> 📖 **Full beginner-friendly guide**: [openclaw/README.md](openclaw/README.md) — architecture diagram, 60-second quickstart, step-by-step reproduction, troubleshooting.
+
 The five skills under `.claude/skills/` ship with a parallel
 machine-readable projection at `openclaw/`: one YAML per skill spelling
 out routing triggers, MCP server config, tool signatures, output
