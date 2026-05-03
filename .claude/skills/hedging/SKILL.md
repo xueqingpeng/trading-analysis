@@ -90,6 +90,63 @@ of full news highlights or filing bodies can exceed the model context.
 | `get_filing_section(symbol, date, document_type, section, offset=0, limit=None)` | Fetch one section (`'mda'` or `'risk'`) of a specific filing. Omit `limit` for the whole section; use `offset/limit` to paginate long sections. Returns `{content, total_chars, offset, returned_chars, has_more, …}`. |
 | `apply_pair_action(left, right, action, prices, current_position?)` | Optional helper for deterministic dollar-neutral pair-position math (`LONG_SHORT`, `SHORT_LONG`, `HOLD`, `CLOSE`). Returns the new position dict (or null on `CLOSE`). The output persists the daily lifecycle action, but not the derived share snapshot. |
 
+### Tool Argument Names — Exact Spelling Required
+
+All tool arguments use `snake_case` with underscores. The parameter names must match exactly — do **not** drop underscores, add spaces, or alter spelling in any way.
+
+| ❌ Wrong | ✅ Correct |
+|---|---|
+| `datestart` | `date_start` |
+| `dateend` | `date_end` |
+| `preview chars` | `preview_chars` |
+| `documenttype` | `document_type` |
+| `targetdate` | `target_date` |
+
+Correct `list_news` call example:
+```json
+{
+  "symbol": "MSFT",
+  "date_start": "2025-12-29",
+  "date_end": "2026-01-05",
+  "preview_chars": 300
+}
+```
+
+### Tool Argument Types — Never Stringify Structured Values
+
+Arguments typed as `dict` or `list` must be passed as **native JSON objects/arrays**, never as JSON-encoded strings. Pydantic validation will reject a string even if it contains valid JSON.
+
+**`apply_pair_action` → `current_position` (dict)**
+
+Pass the dict returned by a prior `apply_pair_action` call directly as an object:
+
+```json
+{
+  "left": "NVDA", "right": "AAPL",
+  "action": "HOLD",
+  "prices": {"NVDA": 140.0, "AAPL": 210.0},
+  "current_position": {"direction": "LONG_SHORT", "shares": {"NVDA": 0.003, "AAPL": -0.002}, "entry_prices": {"NVDA": 140.0, "AAPL": 210.0}}
+}
+```
+
+❌ **Wrong** — do NOT wrap it in quotes:
+```json
+{ "current_position": "{\"direction\": \"LONG_SHORT\", ...}" }
+```
+
+**`get_common_trading_dates` → `symbols` (list)**
+
+Pass a JSON array, not a stringified list:
+
+```json
+{ "date_start": "2026-01-01", "date_end": "2026-01-05", "symbols": ["NVDA", "AAPL"] }
+```
+
+❌ **Wrong** — do NOT stringify the array:
+```json
+{ "symbols": "[\"NVDA\", \"AAPL\"]" }
+```
+
 ### Helper Scripts
 
 Use helper scripts via Bash instead of writing inline Python:
