@@ -3,47 +3,42 @@ skill:
   id: report_generation
   display_name: Weekly Equity Research Report Generation Skill
   description: >
-    Generates structured weekly equity research reports for a single symbol
-    every Monday over a 3-month window (2025-03-01 to 2025-05-31) by querying
-    the offline DuckDB through the `trading_mcp` MCP server. Each report
-    covers the prior calendar week, computes 11 required metrics, and issues
-    a graduated Strong BUY / BUY / HOLD / SELL / Strong SELL rating with
-    rationale. Produces ~13 individual Markdown files per run, stored inside
-    a run-specific subfolder.
+    Generates one standalone weekly equity research report for a single
+    symbol on one target week-ending date (typically a Friday). Reads
+    market data, news, filings, and peer-benchmark context through the
+    `report_generation_mcp` server (offline DuckDB), then writes one
+    Markdown report plus a run-level summary JSON via
+    `upsert_report.py`. Caller drives the weekly loop over the target
+    window.
   enabled: true
   procedure_source: ../../.claude/skills/report_generation/SKILL.md
 
 routing:
   auto_invoke: true
-  priority: 87
+  priority: 90
   stop_after_match: true
   positive_triggers:
     verbs:
       - generate equity report
+      - generate weekly report
       - produce weekly report
       - write research note
       - produce equity research
       - write a report
-      - generate weekly reports
     nouns:
       - weekly report
       - equity research report
       - research note
       - weekly equity report
-      - Monday report
-    symbols:
-      - AAPL
-      - ADBE
-      - AMZN
-      - GOOGL
-      - META
-      - MSFT
-      - NVDA
-      - TSLA
+      - Friday report
+    phrasings:
+      - "generate the weekly equity research report for X for the week ending YYYY-MM-DD"
+      - "weekly report for X on YYYY-MM-DD"
+      - "write a report for X"
   negative_triggers:
     - trading decision
     - BUY SELL HOLD single day
-    - pair trading
+    - hedging
     - audit filing
     - evaluate reports
     - score reports
@@ -54,176 +49,217 @@ model_selection:
   allow_fallback: true
   requires_capabilities:
     - tool_calling
-    - bash
-    - file_io
+    - mcp
 
-# Report-generation in the claude-agent-sdk branch is SKILL.md-only — no
-# dedicated MCP server. The agent uses Bash + inline pandas to read
-# parquet / DuckDB it has access to (caller-controlled).
-mcp_servers: []
-
-runtime:
-  executor: claude-code-bash
+mcp_servers:
+  - id: report_generation_mcp
+    command: python3
+    args:
+      - .claude/skills/report_generation/scripts/mcp/report_generation_mcp.py
+    env:
+      REPORT_GENERATION_DB_PATH: ${REPORT_GENERATION_DB_PATH:-./env.duckdb}
+      REPORT_GENERATION_AS_OF_DATE: ${REPORT_GENERATION_AS_OF_DATE}
+    required: true
 
 tools:
-  # Pure-bash skill — these are reference patterns the agent may invoke,
-  # not MCP-server tools.
-  - name: bash_inline_python_pandas
-    purpose: "Use Bash to run inline Python with pandas for parquet/DuckDB reads and metric computation."
-  - name: write_markdown_per_monday
-    purpose: "Write one .md per Monday immediately after generating it; do not accumulate."
+  - name: is_trading_day
+    mcp_server: report_generation_mcp
+    preferred: true
+    signature: "(symbol, target_date) -> {is_trading_day, reason, prev_trading_day, prev_trading_day_adj_close, latest_date_in_db, should_upsert}"
+    purpose: >
+      First call. `reason` ∈ {trading_day, weekend, holiday, not_loaded}.
+      Resolves the actual report date when target_date is a Friday holiday
+      (falls back to the prior trading day automatically).
+  - name: get_prices
+    mcp_server: report_generation_mcp
+    signature: "(symbol, date_start, date_end) -> rows[{symbol, date, open, high, low, close, adj_close, volume}]"
+    purpose: OHLCV history. `adj_close` is canonical for all metrics.
+  - name: get_indicator
+    mcp_server: report_generation_mcp
+    signature: "(symbol, date_start, date_end, indicator, length?) -> rows"
+    purpose: ma / rsi / bbands / macd from adj_close. The skill leans on this for technical-indicator narrative.
+  - name: list_news
+    mcp_server: report_generation_mcp
+    preferred: true
+    signature: "(symbol, date_start, date_end, preview_chars?=300) -> rows[{symbol, date, id, highlights_chars, highlights_preview}]"
+    purpose: Compact news metadata. Scan previews for the report week, fetch in full only what you need.
+  - name: get_news_by_id
+    mcp_server: report_generation_mcp
+    preferred: true
+    signature: "(symbol, id) -> {symbol, date, id, highlights}"
+    purpose: Full news article body after list_news triage.
+  - name: list_filings
+    mcp_server: report_generation_mcp
+    preferred: true
+    signature: "(symbol, date_start, date_end, document_type?) -> rows[{symbol, date, document_type, mda_chars, risk_chars}]"
+    purpose: Compact filings metadata; decide which section to read.
+  - name: get_filing_section
+    mcp_server: report_generation_mcp
+    preferred: true
+    signature: "(symbol, date, document_type, section, offset=0, limit=None) -> {content, total_chars, offset, returned_chars, has_more, ...}"
+    purpose: Paginated read of mda or risk section.
+  - name: get_weekly_metrics
+    mcp_server: report_generation_mcp
+    signature: "(symbol, target_date) -> {week, prices, returns, volatility, ma, rsi, macd, bollinger, ...}"
+    purpose: >
+      Pre-computed weekly metric block for the target_date's trading week.
+      Saves the agent from re-deriving open/close/return/MA-direction
+      inline. Server-side computation; one call per report.
+  - name: list_peers
+    mcp_server: report_generation_mcp
+    signature: "(symbol) -> {sector, peers}"
+    purpose: Static peer list and sector label for the relative-comparison section.
+
+scripts:
+  - name: upsert_report
+    path: .claude/skills/report_generation/scripts/upsert_report.py
+    invocation: >
+      cat <<'MD' | python3 .claude/skills/report_generation/scripts/upsert_report.py
+        --symbol {SYMBOL} --target-date {TARGET_DATE}
+        --action {Strong BUY|BUY|HOLD|SELL|Strong SELL}
+        --price {WEEK_CLOSE} --model {MODEL}
+        --output-root {OUTPUT_ROOT}
+      <full report markdown body>
+      MD
+    purpose: >
+      Pipes the full Markdown report body on stdin; writes both the
+      summary record into the run JSON AND the per-week .md file. Owns
+      filename sanitization, dir creation, upsert-by-target-date.
 
 input_schema:
   required:
     - symbol
+    - target_date
   optional:
-    - output_dir
     - agent_name
     - model_name
-  symbols_whitelist:
-    - AAPL
-    - ADBE
-    - AMZN
-    - GOOGL
-    - META
-    - MSFT
-    - NVDA
-    - TSLA
+    - output_root
   defaults:
-    output_dir: results/report_generation
+    output_root: "results/report_generation"
     agent_name: "${OPENCLAW_AGENT_NAME:-claude-code}"
     model_name: "inherit from model_selection.preferred_model"
+  field_rules:
+    symbol: "uppercase, one of the 8-symbol pool"
+    target_date: "YYYY-MM-DD; report covers Mon..target_date of that ISO week"
 
 context_packing:
   include_in_order:
     - skill_procedure
     - symbol
-    - visible_history_up_to_M
-    - prior_calendar_week_rows
-    - prior_week_news_including_weekends
-    - filings_up_to_M
-    - report_template
-  max_context_chars: 80000
-  truncation_policy: keep_current_monday_context
+    - target_date
+    - weekly_metrics_block
+    - news_previews_for_week
+    - filings_compact
+    - peer_list
+  max_context_chars: 100000
+  truncation_policy: keep_target_date_metrics_and_news_previews
 
 output_artifacts:
-  - kind: one_markdown_file_per_monday
-    run_folder_template: "results/report_generation/{agent_name}_report_generation_{SYMBOL}_{model}/"
-    file_template: "{agent_name}_report_generation_{SYMBOL}_{YYYYMMDD}_{model}.md"
-    example:
-      folder: "results/report_generation/claude-code_report_generation_AAPL_claude-sonnet-4-6/"
-      file: "claude-code_report_generation_AAPL_20250303_claude-sonnet-4-6.md"
-    total_files: "~13 per 3-month run"
+  - kind: markdown_plus_run_summary_json
+    written_by: upsert_report.py
+    summary_path_template: "{output_root}/report_generation_{SYMBOL}_{model}.json"
+    per_week_md_path_template: "{output_root}/report_generation_{SYMBOL}_{model}/report_generation_{SYMBOL}_{YYYYMMDD}_{model}.md"
+    record_schema:
+      target_date: "YYYY-MM-DD"
+      action: "Strong BUY | BUY | HOLD | SELL | Strong SELL"
+      price: "week close (adj_close)"
+      model: string
     filename_sanitization:
       rule: "replace any character that is not alphanumeric, '-', or '_' with '_'"
       lowercase: [model]
 
-report_structure:
-  sections:
-    - { id: 1, name: "Executive Summary", length: "3 to 5 sentences" }
-    - { id: 2, name: "Investment Rating & Thesis", length: "rating plus 2 to 3 thesis bullets" }
-    - { id: 3, name: "Weekly Price Performance & Technical Indicators", length: "11-row metrics table" }
-    - { id: 4, name: "News & Catalysts", length: "3 to 5 bullets or 'No news this week.'" }
-    - { id: 5, name: "Earnings & Filings Update", length: "summary of MD&A / Risk Factors or 'No filings available as of {report_date}.'" }
-    - { id: 6, name: "Valuation Snapshot", length: "paragraph" }
-    - { id: 7, name: "Risk Factors", length: "2 to 4 specific bullets" }
-    - { id: 8, name: "Recommendation & Outlook", length: "restated rating plus 2 to 3 sentences" }
-  rating_scale:
-    - { label: "Strong BUY", emoji: "⬆⬆" }
-    - { label: "BUY", emoji: "⬆" }
-    - { label: "HOLD", emoji: "➡" }
-    - { label: "SELL", emoji: "⬇" }
-    - { label: "Strong SELL", emoji: "⬇⬇" }
-  required_metrics:
-    - week_open
-    - week_close
-    - week_high
-    - week_low
-    - weekly_return_pct
-    - ma_4week
-    - ma_1week
-    - price_vs_ma4
-    - return_4week_pct
-    - weekly_volatility_pct
-    - ma_direction
-  metric_formatting:
-    prices: "$ prefix, 2 decimal places"
-    percentages: "sign included, 2 decimal places, % suffix"
-    canonical_price_source: adj_close
-
 constraints:
   no_look_ahead:
-    rule: "On Monday M, all MCP calls must use date_end <= M."
-  weekend_holiday_news:
-    rule: "Include news from the full 7-day calendar period (Monday to Sunday of the prior week); the MCP casts news TIMESTAMP to DATE on filter so weekend news is preserved."
-  holiday_monday_fallback:
-    rule: "If get_prices returns no row for Monday M, use the next available trading day in that week as the report date."
-  moving_average_defaults:
-    rule: "ma_4week = SMA over 20 adj_close rows ending the last trading day of the prior week. ma_1week = SMA over adj_close rows within the prior calendar week."
-  ma_direction:
-    rule: "ma_direction ∈ {Up, Down, Flat} from sign of (ma_1week - ma_4week). Replaces the old momentum row in the metrics table."
-  hold_is_not_default:
-    rule: "HOLD is used only when signals are genuinely mixed. Apply analytical judgment."
+    rule: "Every MCP call must use date_end <= target_date. Never read future news / prices / filings."
+  one_week_per_invocation:
+    rule: "Exactly one (symbol, target_date) per call. Caller drives the weekly loop."
+  trading_day_resolution:
+    rule: >
+      If target_date is a market holiday, is_trading_day automatically
+      returns the prior trading day; use that as the actual report date.
+  bash_invocation_required:
+    rule: >
+      The skill is NOT done until upsert_report.py has actually been
+      invoked via Bash with the markdown body piped on stdin. A text-only
+      response describing the report is a FAILURE.
 
 behavior_rules:
-  - All data comes from the `trading_mcp` MCP server. Never call external APIs.
-  - Never use data beyond the Monday the report is written.
-  - Each report must contain all 8 sections with exact headers `### 1.` through `### 8.`.
-  - The 11-row metrics table is required in every report, even with short history.
-  - Write each `.md` file immediately after generating that Monday's report. Do not accumulate and dump at the end.
-  - Do not combine weekly reports into a single file. Do not output raw JSON.
-  - Do not write files directly to `results/report_generation/`. Every file goes inside the run-specific subfolder.
-  - Do not create temporary scripts, notebooks, debug logs, or intermediate files.
+  - All market data through the `report_generation_mcp` MCP server. No external APIs.
+  - is_trading_day is the first call; resolves holiday fallback.
+  - Use list_news + get_news_by_id and list_filings + get_filing_section to stay under the inline-result size limit.
+  - get_weekly_metrics provides the canonical metric block; do not re-derive metrics inline.
+  - The agent reasons holistically over OHLCV + indicators + news + filings + peer benchmark, then emits one rating from {Strong BUY, BUY, HOLD, SELL, Strong SELL}.
+  - The full Markdown report body is piped to upsert_report.py on stdin; do not write the .md file inline.
+  - Pass --output-root the caller specified.
 
 procedure:
   - step: 1
-    name: enumerate_mondays
-    description: List every Monday in 2025-03-01 to 2025-05-31. For holidays, probe get_prices to find the next trading day.
+    name: is_trading_day
+    description: is_trading_day(symbol, target_date). If reason='not_loaded', stop and report. Else use the resolved date as the report date.
   - step: 2
-    name: loop_over_mondays
-    description: >
-      For each Monday M, call get_prices/get_news/get_filings scoped to
-      date_end <= M. Identify the prior calendar week (7-day Mon to Sun).
-      Compute all 11 metrics from adj_close / high / low. Assemble the full
-      8-section Markdown in memory. Write the file immediately. Move to the
-      next Monday.
+    name: weekly_metrics
+    description: get_weekly_metrics(symbol, target_date) for the canonical metric block.
   - step: 3
-    name: verify_output_folder
-    description: Ensure the run-specific subfolder exists before the first write.
+    name: news_filings_peers
+    description: >
+      list_news + get_news_by_id over the report week; list_filings +
+      get_filing_section for any 10-K/10-Q on or before target_date;
+      list_peers for the sector context.
+  - step: 4
+    name: optional_indicators
+    description: Optional get_indicator (ma / rsi / bbands / macd) if the analysis warrants extra technical color beyond get_weekly_metrics.
+  - step: 5
+    name: synthesize_report
+    description: >
+      Compose the full Markdown report body covering the structured
+      sections in SKILL.md, with one rating from the 5-level scale at the
+      top.
+  - step: 6
+    name: upsert_report
+    description: >
+      Pipe the markdown body on stdin to upsert_report.py with --symbol,
+      --target-date, --action, --price, --model, --output-root.
 
 prompt_template: |
-  You are the weekly equity research report generation skill. Produce one
-  Markdown report per Monday in 2025-03-01 to 2025-05-31 for symbol `{symbol}`.
+  You are the weekly equity report generation skill. Generate ONE
+  standalone weekly report for symbol `{symbol}` for the trading week
+  ending on `{target_date}` (typically a Friday).
 
-  Canonical procedure is documented at: {procedure_source}
+  Canonical procedure: {procedure_source}
 
   Inputs:
-    symbol      = {symbol}
-    output_dir  = {output_dir}
-    agent_name  = {agent_name}
-    model       = {model_name}
+    symbol       = {symbol}
+    target_date  = {target_date}
+    output_root  = {output_root}
+    agent_name   = {agent_name}
+    model        = {model_name}
 
-  Data: `trading_mcp` MCP server (offline DuckDB). Use adj_close for all
-  price metrics. Never touch parquet or external APIs.
-
-  For each Monday M:
-    1. Verify M is a trading day; if not, use the next trading day in that week.
-    2. Call get_prices / get_news / get_filings scoped to date_end <= M.
-    3. Compute the 11 required metrics from the prior calendar week.
-    4. Assemble the full 8-section Markdown (rating scale ⬆⬆ ⬆ ➡ ⬇ ⬇⬇).
-    5. Write the file immediately to:
-         {output_dir}/{agent_name}_report_generation_{symbol}_{model}/{agent_name}_report_generation_{symbol}_{YYYYMMDD}_{model}.md
+  MCP tools on `report_generation_mcp` (prefer compact list/get pairs):
+    - is_trading_day(symbol, target_date)            [call first]
+    - get_weekly_metrics(symbol, target_date)        [canonical metrics]
+    - get_prices(symbol, date_start, date_end)
+    - get_indicator(symbol, date_start, date_end, indicator, length?)
+    - list_news(symbol, date_start, date_end, preview_chars?)   [preferred]
+    - get_news_by_id(symbol, id)                                [preferred]
+    - list_filings(symbol, date_start, date_end, document_type?) [preferred]
+    - get_filing_section(symbol, date, document_type, section, offset=0, limit=None)
+    - list_peers(symbol)
 
   Hard rules:
-    - Never use data beyond M.
-    - All 8 sections required in every report. Do not rename or reorder.
-    - The 11-metric table is required even when history is short.
-    - News section must cover the full 7-day calendar week.
-    - Write each file immediately. Do not combine into a single file.
-    - Do not emit raw JSON or intermediate scripts to disk.
+    1. is_trading_day first; resolves holiday fallback.
+    2. Every MCP call has date_end <= target_date.
+    3. Use the compact list/get pairs.
+    4. The skill is NOT done until upsert_report.py has been invoked via
+       Bash with the markdown body piped on stdin.
+    5. Pass --output-root={output_root} and --model={model_name} exactly
+       as given (do not substitute your own model name).
+
+  Output:
+    Summary JSON: {output_root}/report_generation_{SYMBOL}_{model}.json
+    Per-week MD : {output_root}/report_generation_{SYMBOL}_{model}/report_generation_{SYMBOL}_{YYYYMMDD}_{model}.md
 
 output:
-  format: markdown_per_monday
-  primary_artifact_folder: "results/report_generation/{agent_name}_report_generation_{symbol}_{model}/"
-  write_strategy: one_file_per_monday_immediate
-  chat_return: "count of reports written, date range covered, and the folder path"
+  format: markdown_per_week_plus_summary_json
+  primary_artifact_folder: "{output_root}/report_generation_{SYMBOL}_{model}/"
+  write_strategy: "via upsert_report.py CLI with markdown body on stdin"
+  chat_return: "brief: rating, week ending, one-sentence rationale"
