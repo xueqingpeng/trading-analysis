@@ -1,0 +1,5 @@
+| Model | Cases | Completed | Errors | Valid Plans | Avg Score |
+|---|---:|---:|---:|---:|---:|
+| `nvidia/nemotron-nano-9b-v2` | 13 | 13 | 0 | 11 | 63.87 |
+| `google/gemma-4-26b-a4b-it` | 13 | 13 | 0 | 13 | 73.86 |
+| `qwen/qwen-plus-2025-07-28` | 13 | 13 | 0 | 12 | 67.17 |
