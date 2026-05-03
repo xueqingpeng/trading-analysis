@@ -1,0 +1,21 @@
+[project]
+name = "claude-skills"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.96.0",
+    "deepagents>=0.5.3",
+    "duckdb>=1.5.2",
+    "exchange-calendars>=4.13.2",
+    "fastmcp>=3.2.4",
+    "langchain-anthropic>=1.4.1",
+    "langchain-mcp-adapters>=0.2.2",
+    "langchain-openai>=1.2.0",
+    "logfire>=4.32.1",
+    "pandas-ta>=0.4.71b0",
+    "python-dotenv>=1.2.2",
+    "rich>=15.0.0",
+    "typer>=0.24.2",
+]

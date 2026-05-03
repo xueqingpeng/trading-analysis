@@ -1,0 +1,34 @@
+{
+  "status": "in_progress",
+  "symbol": "TSLA",
+  "model": "claude-sonnet-4-7",
+  "start_date": "2026-01-02",
+  "end_date": "2026-01-09",
+  "recommendations": [
+    {
+      "date": "2026-01-02",
+      "price": 438.07,
+      "recommended_action": "SELL"
+    },
+    {
+      "date": "2026-01-06",
+      "price": 432.9599914550781,
+      "recommended_action": "SELL"
+    },
+    {
+      "date": "2026-01-07",
+      "price": 431.41,
+      "recommended_action": "HOLD"
+    },
+    {
+      "date": "2026-01-08",
+      "price": 435.7999877929687,
+      "recommended_action": "HOLD"
+    },
+    {
+      "date": "2026-01-09",
+      "price": 445.010009765625,
+      "recommended_action": "HOLD"
+    }
+  ]
+}

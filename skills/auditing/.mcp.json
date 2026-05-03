@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "auditing_mcp": {
+      "command": "python3",
+      "args": [".claude/skills/auditing/scripts/mcp/auditing_mcp.py"]
+    }
+  }
+}
