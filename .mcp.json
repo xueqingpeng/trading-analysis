@@ -7,6 +7,10 @@
     "pair_trading_mcp": {
       "command": "python3",
       "args": ["pair_trading/mcp/pair_trading_mcp.py"]
+    },
+    "resource_reallocation_mcp": {
+      "command": "python3",
+      "args": ["resource_reallocation/mcp/resource_reallocation_mcp.py"]
     }
   }
 }
