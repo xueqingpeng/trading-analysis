@@ -1,0 +1,320 @@
+version: 1
+skill:
+  id: report_evaluation
+  display_name: Weekly Equity Report Evaluation Skill
+  description: >
+    Scores a run of weekly equity research reports (produced by
+    `report_generation`) along five dimensions: quantitative
+    price-prediction performance, structural completeness, content
+    accuracy (metric verification, news leakage), evidence fidelity, and
+    reasoning quality. Reads price / news / filings via the
+    `report_evaluation_mcp` server and the report Markdown corpus via
+    `list_reports` / `get_report_content`. Writes one JSON + Markdown
+    summary per agent / symbol / model run via
+    `upsert_evaluation.py`.
+  enabled: true
+  procedure_source: ../../.claude/skills/report_evaluation/SKILL.md
+
+routing:
+  auto_invoke: true
+  priority: 92
+  stop_after_match: true
+  positive_triggers:
+    verbs:
+      - evaluate reports
+      - score reports
+      - audit reports
+      - assess reports
+      - run report eval
+      - check the reports
+    nouns:
+      - report quality
+      - hallucinations in reports
+      - report evaluation
+      - rubric score
+      - price prediction performance
+      - news leakage
+    phrasings:
+      - "evaluate the codex/TSLA/gpt-5 run"
+      - "how good are these reports"
+      - "did the X reports get the direction right"
+      - "verify the metrics in these reports"
+  negative_triggers:
+    - generate report
+    - write a report
+    - produce weekly report
+    - trading decision
+    - hedging
+    - audit filing
+
+model_selection:
+  preferred_provider: claude
+  preferred_model: claude-sonnet-4-6
+  allow_fallback: true
+  large_context_alternative:
+    model: claude-opus-4-7
+    when: "all weeks of reports plus full price context must be loaded in one turn"
+  requires_capabilities:
+    - tool_calling
+    - mcp
+
+mcp_servers:
+  - id: report_evaluation_mcp
+    command: python3
+    args:
+      - .claude/skills/report_evaluation/scripts/mcp/report_evaluation_mcp.py
+    env:
+      REPORT_EVALUATION_DB_PATH: ${REPORT_EVALUATION_DB_PATH:-./env.duckdb}
+      REPORT_EVALUATION_REPORTS_ROOT: ${REPORT_EVALUATION_REPORTS_ROOT:-./results/report_generation}
+    required: true
+
+tools:
+  # report-corpus tools — what the skill needs that report_generation does NOT
+  - name: list_reports
+    mcp_server: report_evaluation_mcp
+    preferred: true
+    signature: "(agent, symbol, model) -> rows[{filename, target_date, ...}]"
+    purpose: >
+      Enumerate the .md files under
+      results/report_generation/{agent}_..._{symbol}_{model}/. Use to
+      discover what target dates are in scope for the run.
+  - name: get_report_content
+    mcp_server: report_evaluation_mcp
+    preferred: true
+    signature: "(agent, symbol, model, target_date) -> {target_date, content, filepath}"
+    purpose: Full markdown body for one report.
+  - name: get_report_metrics
+    mcp_server: report_evaluation_mcp
+    signature: "(agent, symbol, model, target_date) -> {open, close, week_high, week_low, weekly_return_pct, ma_4week, ma_1week, return_4week_pct, ma_direction, momentum, ...}"
+    purpose: >
+      Parses the metrics table out of the report's Section 3 into
+      structured floats. Saves the agent from hand-parsing markdown
+      tables for the metric-verification rubric.
+  - name: verify_weekly_metrics
+    mcp_server: report_evaluation_mcp
+    signature: "(symbol, target_date, reported_metrics) -> {checked, correct, errors, expected}"
+    purpose: >
+      Recomputes the canonical metric block from the DuckDB and compares
+      to the reported_metrics dict. Returns per-metric pass/fail with
+      tolerance. Source for the evidence-fidelity numeric-accuracy score.
+  - name: get_forward_returns
+    mcp_server: report_evaluation_mcp
+    signature: "(symbol, target_date, days_ahead?) -> {forward_returns_pct, daily_path}"
+    purpose: >
+      Look up the *future* (post-target_date) adj_close trajectory used
+      to score price-prediction performance. Only the evaluation skill is
+      allowed to look ahead.
+  - name: check_news_leakage
+    mcp_server: report_evaluation_mcp
+    signature: "(symbol, target_date, content) -> {leaks, suspicious_dates, ...}"
+    purpose: >
+      Scan the report's narrative for references to news dated AFTER
+      target_date — the canonical "future-leak" check. Source for the
+      content-accuracy hallucination signal.
+  - name: search_news
+    mcp_server: report_evaluation_mcp
+    signature: "(symbol, query, date_start, date_end) -> rows[{symbol, date, id, title, snippet}]"
+    purpose: Substring search over the news index for verifying specific claims in the report.
+
+  # Same data tools as report_generation, since the skill also needs to
+  # cross-check news / filings / prices independently.
+  - name: get_prices
+    mcp_server: report_evaluation_mcp
+    signature: "(symbol, date_start, date_end) -> rows[{symbol, date, open, high, low, close, adj_close, volume}]"
+    purpose: Recompute expected metrics; build forward-return baseline.
+  - name: get_indicator
+    mcp_server: report_evaluation_mcp
+    signature: "(symbol, date_start, date_end, indicator, length?) -> rows"
+    purpose: Cross-check indicator values cited in the report.
+  - name: list_news
+    mcp_server: report_evaluation_mcp
+    preferred: true
+    signature: "(symbol, date_start, date_end, preview_chars?) -> rows[{symbol, date, id, highlights_chars, highlights_preview}]"
+    purpose: Compact news metadata for traceability checks.
+  - name: get_news_by_id
+    mcp_server: report_evaluation_mcp
+    preferred: true
+    signature: "(symbol, id) -> {symbol, date, id, highlights}"
+    purpose: Full article when a specific news claim needs verification.
+  - name: list_filings
+    mcp_server: report_evaluation_mcp
+    preferred: true
+    signature: "(symbol, date_start, date_end, document_type?) -> rows[{symbol, date, document_type, mda_chars, risk_chars}]"
+    purpose: Filings traceability check for Section 5 of each report.
+  - name: get_filing_section
+    mcp_server: report_evaluation_mcp
+    preferred: true
+    signature: "(symbol, date, document_type, section, offset=0, limit=None) -> {content, ...}"
+    purpose: Verify filings cited in the reports.
+
+scripts:
+  - name: upsert_evaluation
+    path: .claude/skills/report_evaluation/scripts/upsert_evaluation.py
+    invocation: >
+      cat <<'JSON' | python3 .claude/skills/report_evaluation/scripts/upsert_evaluation.py
+        --symbol {SYMBOL} --model {TARGET_MODEL}
+        --output-root {OUTPUT_ROOT}
+      <full evaluation JSON object>
+      JSON
+    purpose: >
+      Pipes the full evaluation JSON on stdin; writes
+      `<output_root>/report_evaluation_{SYMBOL}_{model}.json` plus a
+      sibling `.md` summary. Owns sanitization, dir creation, payload
+      defaults.
+
+input_schema:
+  required:
+    - symbol
+    - target_agent
+    - target_model
+  optional:
+    - benchmark_root
+    - output_root
+    - agent_name
+    - model_name
+  defaults:
+    output_root: "results/report_evaluation"
+    agent_name: "${OPENCLAW_AGENT_NAME:-claude-code}"
+    model_name: "inherit from model_selection.preferred_model"
+  field_rules:
+    target_agent: "the agent whose report-generation run is being evaluated, e.g. codex"
+    target_model: "the model that ran report-generation, e.g. gpt-5"
+
+context_packing:
+  include_in_order:
+    - skill_procedure
+    - symbol
+    - target_agent_target_model
+    - all_report_markdown_bodies
+    - per_report_metric_diffs
+    - forward_returns_per_target_date
+    - news_leakage_per_report
+  max_context_chars: 200000
+  truncation_policy: keep_all_reports_and_canonical_diffs
+
+output_artifacts:
+  - kind: json_plus_summary_md
+    written_by: upsert_evaluation.py
+    path_template: "{output_root}/report_evaluation_{SYMBOL}_{target_model}.json"
+    sibling_md_template: "{output_root}/report_evaluation_{SYMBOL}_{target_model}.md"
+    document_shape:
+      status: completed
+      symbol: string
+      ticker: string
+      model: "target model identifier"
+      evaluation_date: "YYYY-MM-DD (today)"
+      reports_evaluated: int
+      price_performance: "long_short / long_only / buy_and_hold blocks"
+      per_report: array
+      aggregate_scores: object
+      run_rubric_summary: object
+    filename_sanitization:
+      rule: "replace any character that is not alphanumeric, '-', or '_' with '_'"
+      lowercase: [model]
+
+constraints:
+  no_external_apis:
+    rule: "All data comes from the `report_evaluation_mcp` server. No yfinance, no network."
+  forward_lookup_allowed_only_here:
+    rule: >
+      Unlike the other four skills, report_evaluation is the only place
+      that may consume forward (post-target_date) data — that's exactly
+      what `get_forward_returns` exposes for scoring price-prediction
+      performance. Other tools still respect the report's target_date
+      when re-computing expected metrics.
+  one_run_per_invocation:
+    rule: "One JSON file per (target_agent, symbol, target_model). Do not combine multiple runs."
+  per_report_required:
+    rule: "All five evaluation dimensions appear in every per_report entry."
+  bash_invocation_required:
+    rule: >
+      The skill is NOT done until upsert_evaluation.py has actually been
+      invoked via Bash with the JSON payload piped on stdin.
+
+behavior_rules:
+  - All data through `report_evaluation_mcp`. No yfinance / network.
+  - Discover reports with list_reports; read each via get_report_content.
+  - Use get_report_metrics + verify_weekly_metrics for the numeric-accuracy rubric (don't hand-parse markdown tables).
+  - Use check_news_leakage for the future-leak / hallucination signal.
+  - Use get_forward_returns for the price-prediction simulation.
+  - Pipe the final JSON to upsert_evaluation.py via stdin; do not write JSON inline.
+  - Pass --output-root the caller specified and --model = the target model (NOT the eval model).
+
+procedure:
+  - step: 1
+    name: discover_reports
+    description: list_reports(target_agent, symbol, target_model) -> sorted list of target_date entries.
+  - step: 2
+    name: per_report_loop
+    description: >
+      For each target_date: get_report_content, get_report_metrics,
+      verify_weekly_metrics, check_news_leakage, get_forward_returns. Score
+      structure / content / evidence / reasoning per the rubric in SKILL.md.
+  - step: 3
+    name: price_simulation
+    description: >
+      Build daily recommendations forward-filling each week's rating;
+      run long_short / long_only / buy_and_hold via the formulas in
+      SKILL.md.
+  - step: 4
+    name: aggregate_and_summarize
+    description: >
+      Compute aggregate_scores (mean of four rubric dimensions) and
+      run_rubric_summary (cross-report patterns: systematic_issues +
+      consistent_strengths + overall_assessment 2-4 sentences).
+  - step: 5
+    name: upsert_evaluation
+    description: Pipe the assembled JSON on stdin to upsert_evaluation.py with --symbol, --model=target_model, --output-root.
+
+prompt_template: |
+  You are the weekly equity report evaluation skill. Score one
+  agent-symbol-model report run end to end.
+
+  Canonical procedure: {procedure_source}
+
+  Inputs:
+    symbol         = {symbol}
+    target_agent   = {target_agent}
+    target_model   = {target_model}
+    output_root    = {output_root}
+    agent_name     = {agent_name}
+    model          = {model_name}
+
+  MCP tools on `report_evaluation_mcp`:
+    [report-corpus]
+    - list_reports(agent, symbol, model)
+    - get_report_content(agent, symbol, model, target_date)
+    - get_report_metrics(agent, symbol, model, target_date)
+    - verify_weekly_metrics(symbol, target_date, reported_metrics)
+    - get_forward_returns(symbol, target_date, days_ahead?)
+    - check_news_leakage(symbol, target_date, content)
+    - search_news(symbol, query, date_start, date_end)
+    [shared data]
+    - get_prices, get_indicator
+    - list_news + get_news_by_id        [preferred]
+    - list_filings + get_filing_section [preferred]
+
+  Five evaluation dimensions:
+    1. Quantitative price prediction (long_short / long_only / buy_and_hold).
+    2. Structure (sections, headers, table completeness).
+    3. Content accuracy (verify_weekly_metrics + dates/symbol/metadata).
+    4. Evidence fidelity (news + filings traceability + check_news_leakage).
+    5. Reasoning quality (rating-evidence consistency, thesis distinctness).
+
+  Hard rules:
+    1. All data via MCP; no external APIs.
+    2. forward-lookup allowed ONLY through get_forward_returns.
+    3. The skill is NOT done until upsert_evaluation.py has been invoked
+       via Bash with the JSON payload on stdin.
+    4. Pass --output-root={output_root} and --model={target_model}
+       (NOT your own model name).
+
+  Output:
+    {output_root}/report_evaluation_{SYMBOL}_{target_model}.json
+    {output_root}/report_evaluation_{SYMBOL}_{target_model}.md
+
+output:
+  format: json_plus_summary_md
+  primary_artifact: "{output_root}/report_evaluation_{SYMBOL}_{target_model}.json"
+  write_strategy: "via upsert_evaluation.py CLI with JSON body on stdin"
+  chat_return: "brief: aggregate scores + most prominent systematic issue"

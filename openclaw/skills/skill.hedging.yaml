@@ -1,0 +1,314 @@
+version: 1
+skill:
+  id: hedging
+  display_name: Daily Pair-Hedging Decision Skill
+  description: >
+    Makes one daily hedging decision for a fixed ordered stock pair, or
+    selects the fixed pair on the run's first day, by querying offline
+    data through the `hedging_mcp` server. Each invocation handles
+    exactly one (target_date) and upserts one recommendation into
+    `results/hedging/`. Caller drives backtest replay (loop over dates)
+    or live by passing `IS_FIRST_DAY=True` once and `False` thereafter.
+  enabled: true
+  procedure_source: ../../.claude/skills/hedging/SKILL.md
+
+routing:
+  auto_invoke: true
+  priority: 95
+  stop_after_match: true
+  positive_triggers:
+    verbs:
+      - hedge
+      - hedging
+      - run hedging
+      - start hedging
+      - select pair
+      - run pair hedging
+    nouns:
+      - hedging decision
+      - pair hedging
+      - daily hedging
+      - hedge action
+    actions:
+      - LONG_SHORT
+      - SHORT_LONG
+      - HOLD
+      - CLOSE
+    phrasings:
+      - "start hedging on YYYY-MM-DD"
+      - "run hedging for YYYY-MM-DD"
+      - "hedge today"
+      - "make hedging decision"
+  negative_triggers:
+    - single-stock decision
+    - trade AAPL
+    - weekly report
+    - generate report
+    - evaluate reports
+    - audit filing
+    - XBRL
+
+model_selection:
+  preferred_provider: claude
+  preferred_model: claude-sonnet-4-6
+  allow_fallback: true
+  requires_capabilities:
+    - tool_calling
+    - mcp
+
+mcp_servers:
+  - id: hedging_mcp
+    command: python3
+    args:
+      - .claude/skills/hedging/scripts/mcp/hedging_mcp.py
+    env:
+      HEDGING_DB_PATH: ${HEDGING_DB_PATH:-./env.duckdb}
+    required: true
+
+tools:
+  # call first every day — replaces weekday + missing-row + stale-leg checks
+  - name: is_pair_trading_day
+    mcp_server: hedging_mcp
+    preferred: true
+    signature: "(left, right, target_date) -> {is_trading_day, reason, prices, prev_trading_day, prev_prices, latest_common_date, should_upsert}"
+    purpose: >
+      First call every daily run. `reason` ∈ {trading_day, weekend,
+      holiday, missing_leg, not_loaded}. Forces HOLD on weekend/holiday
+      and stops on not_loaded.
+  - name: get_stock_pool
+    mcp_server: hedging_mcp
+    signature: "() -> {pool_name, symbols, backend, db_path, data_dir, file_pattern}"
+    purpose: Candidate set for pair selection on the run's first day.
+  - name: get_common_trading_dates
+    mcp_server: hedging_mcp
+    signature: "(date_start, date_end, symbols?) -> sorted list of common-trading-date strings"
+    purpose: >
+      Calendar discovery, primarily to derive TARGET_DATE when the caller
+      didn't supply one (the last returned date in a sane recent range
+      becomes TARGET_DATE).
+  - name: get_prices
+    mcp_server: hedging_mcp
+    signature: "(symbol, date_start, date_end) -> rows[{symbol, date, price, volume}]"
+    purpose: "OHLCV-style trend / volatility context. `price` is adj_close."
+  - name: get_pair_prices
+    mcp_server: hedging_mcp
+    signature: "(left, right, target_date) -> {available, date, prices}"
+    purpose: One-shot fetch of both legs' prices for the day's record.
+  - name: list_news
+    mcp_server: hedging_mcp
+    preferred: true
+    signature: "(symbol, date_start, date_end, preview_chars?=300) -> rows[{symbol, date, id, highlights_chars, highlights_preview}]"
+    purpose: Compact news metadata; scan previews first, then fetch in full.
+  - name: get_news_by_id
+    mcp_server: hedging_mcp
+    preferred: true
+    signature: "(symbol, id) -> {symbol, date, id, highlights}"
+    purpose: Full article after list_news triage.
+  - name: list_filings
+    mcp_server: hedging_mcp
+    preferred: true
+    signature: "(symbol, date_start, date_end, document_type?) -> rows[{symbol, date, document_type, mda_chars, risk_chars}]"
+    purpose: Compact filing metadata; decide which section is worth reading.
+  - name: get_filing_section
+    mcp_server: hedging_mcp
+    preferred: true
+    signature: "(symbol, date, document_type, section, offset=0, limit=None) -> {content, total_chars, offset, returned_chars, has_more, ...}"
+    purpose: Paginated read of mda or risk section of one filing.
+  - name: apply_pair_action
+    mcp_server: hedging_mcp
+    optional: true
+    signature: "(left, right, action, prices, current_position?) -> new_position | null"
+    purpose: Optional dollar-neutral pair-position math helper.
+
+scripts:
+  - name: upsert_hedging_decision
+    path: .claude/skills/hedging/scripts/upsert_hedging_decision.py
+    invocation: >
+      python3 .claude/skills/hedging/scripts/upsert_hedging_decision.py
+      --left {LEFT} --right {RIGHT} --target-date {TARGET_DATE}
+      --left-price {LEFT_PRICE} --right-price {RIGHT_PRICE}
+      --action {LONG_SHORT|SHORT_LONG|HOLD|CLOSE}
+      --model {MODEL}
+      --output-root {OUTPUT_ROOT}
+    purpose: >
+      Owns load-or-create / sanitize / upsert-by-date / sort / write
+      JSON. `--output-root` MUST be passed when caller specified one
+      (default `results/hedging` is rarely writable in sandboxes).
+  - name: date_offset
+    path: .claude/skills/hedging/scripts/date_offset.py
+    invocation: "python3 .claude/skills/hedging/scripts/date_offset.py {TARGET_DATE} {DAYS}..."
+    purpose: Print TARGET_DATE - N days; saves the agent from inline datetime math.
+
+input_schema:
+  required: []
+  optional:
+    - target_date
+    - is_first_day
+    - agent_name
+    - model_name
+    - output_root
+  defaults:
+    is_first_day: false
+    target_date: "derived from get_common_trading_dates if absent"
+    output_root: "results/hedging"
+    agent_name: "${OPENCLAW_AGENT_NAME:-claude-code}"
+    model_name: "inherit from model_selection.preferred_model"
+  field_rules:
+    target_date: "YYYY-MM-DD"
+    is_first_day: "True only on the run's first day; pair gets selected then. False on subsequent days; pair is read from the existing output file."
+
+context_packing:
+  include_in_order:
+    - skill_procedure
+    - is_first_day
+    - target_date
+    - pool_or_existing_pair
+    - pair_calendar_context
+    - news_previews
+    - filings_compact
+  max_context_chars: 80000
+  truncation_policy: keep_target_date_row_and_compact_lookups
+
+output_artifacts:
+  - kind: upsert_json
+    path_template: "{output_root}/{agent_name}_hedging_{LEFT}_{RIGHT}_{model}.json"
+    written_by: upsert_hedging_decision.py
+    record_schema:
+      date: "YYYY-MM-DD"
+      left: "ticker"
+      right: "ticker"
+      left_price: float
+      right_price: float
+      recommended_action:
+        enum: [LONG_SHORT, SHORT_LONG, HOLD, CLOSE]
+    document_shape:
+      pair: "ordered (left, right)"
+      agent: string
+      model: string
+      start_date: string
+      end_date: string
+      recommendations: array
+
+constraints:
+  is_first_day_consistency:
+    rule: >
+      Before any market-data call, compare IS_FIRST_DAY to whether the
+      output JSON already exists. (True, exists) -> STOP (would
+      overwrite). (False, absent) -> STOP (no pair on disk). Other two
+      combinations proceed.
+  no_look_ahead:
+    rule: >
+      Once TARGET_DATE is established, every MCP call must use date_end
+      <= TARGET_DATE. Single exception: the bootstrap
+      get_common_trading_dates used to derive TARGET_DATE itself.
+  pair_selection_immutability:
+    rule: >
+      Pair is selected exactly once when IS_FIRST_DAY=True and never
+      changes thereafter. Subsequent days read (left, right) from the
+      existing output file.
+  pass_output_root:
+    rule: >
+      If the caller specified --output-root or output_root, pass it
+      through to upsert_hedging_decision.py. Default
+      `results/hedging` is rarely writable inside a sandbox.
+  prefer_compact_tools:
+    rule: >
+      Use list_news + get_news_by_id and list_filings +
+      get_filing_section. Avoid bulk highlight / content fetches that
+      can exceed the model context.
+
+behavior_rules:
+  - All market data comes from `hedging_mcp` MCP tools. Never read DuckDB or parquet directly.
+  - Run is_pair_trading_day first every day; branch on `reason`.
+  - Pair order (left, right) is fixed for the entire run.
+  - Forced-HOLD on weekend/holiday uses prices from is_pair_trading_day.prev_prices.
+  - Output is upserted via upsert_hedging_decision.py; never write JSON inline.
+  - Use the `--output-root` the caller specified (when given).
+  - Do not emit intermediate scripts, debug logs, or partial files.
+
+procedure:
+  - step: 1
+    name: consistency_check
+    description: >
+      Verify (IS_FIRST_DAY, output_file_exists) is one of the two
+      valid combinations. STOP otherwise.
+  - step: 2
+    name: resolve_target_date
+    description: >
+      If TARGET_DATE not supplied: IS_FIRST_DAY=False -> read latest
+      from existing-pair file via is_pair_trading_day; IS_FIRST_DAY=True
+      -> bootstrap with get_common_trading_dates(today-30d, today) and
+      take the last common date.
+  - step: 3
+    name: branch_first_day_or_daily
+    description: >
+      IS_FIRST_DAY=True -> pair selection (steps 4a-4d). Else read
+      (left, right) from output file -> daily hedging (steps 5a-5e).
+  - step: 4a
+    name: select_pool
+    description: get_stock_pool() returns the candidate symbol list.
+  - step: 4b
+    name: select_context
+    description: >
+      For each candidate, fetch get_prices, list_news,
+      list_filings windows ending at TARGET_DATE; drill into selected
+      ids via get_news_by_id and get_filing_section.
+  - step: 4c
+    name: pick_pair
+    description: Pick exactly two distinct symbols, fix the (left, right) order.
+  - step: 5a
+    name: pair_trading_day
+    description: is_pair_trading_day(left, right, TARGET_DATE). Branch on `reason`.
+  - step: 5b
+    name: gather_pair_context
+    description: >
+      get_prices for both legs over your chosen window; list_news
+      previews; list_filings to decide whether to read MD&A or Risk.
+  - step: 5c
+    name: decide_action
+    description: Pick one of LONG_SHORT / SHORT_LONG / HOLD / CLOSE.
+  - step: 6
+    name: upsert
+    description: Run upsert_hedging_decision.py with both legs' prices, action, and --output-root.
+
+prompt_template: |
+  You are the daily pair-hedging skill. Make exactly one decision for a
+  fixed ordered stock pair on TARGET_DATE, or select the pair if this
+  is the run's first day.
+
+  Canonical procedure: {procedure_source}
+
+  Inputs:
+    TARGET_DATE   = {target_date}
+    IS_FIRST_DAY  = {is_first_day}
+    output_root   = {output_root}
+    agent_name    = {agent_name}
+    model         = {model_name}
+
+  MCP tools on `hedging_mcp` (prefer compact list/get pairs):
+    - is_pair_trading_day(left, right, target_date)              [call first daily]
+    - get_stock_pool()                                            [first day]
+    - get_common_trading_dates(date_start, date_end, symbols?)    [calendar bootstrap]
+    - get_prices(symbol, date_start, date_end)
+    - get_pair_prices(left, right, target_date)
+    - list_news(symbol, date_start, date_end, preview_chars?)     [preferred]
+    - get_news_by_id(symbol, id)                                  [preferred]
+    - list_filings(symbol, date_start, date_end, document_type?)  [preferred]
+    - get_filing_section(symbol, date, document_type, section, offset=0, limit=None)
+    - apply_pair_action(left, right, action, prices, current_position?)  [optional helper]
+
+  Hard rules:
+    1. Verify (IS_FIRST_DAY, output_file_exists) consistency before any market call.
+    2. Pair is selected once on day 1 and never changes.
+    3. Every MCP call has date_end <= TARGET_DATE (except the bootstrap get_common_trading_dates).
+    4. Use compact list/get pairs to stay under the inline-result size limit.
+    5. Output goes through upsert_hedging_decision.py; never write JSON inline.
+    6. Pass --output-root {output_root} to the upsert script.
+
+  Decision space: LONG_SHORT, SHORT_LONG, HOLD, CLOSE.
+
+output:
+  format: json
+  primary_artifact: "{output_root}/{agent_name}_hedging_{LEFT}_{RIGHT}_{model}.json"
+  write_strategy: "via upsert_hedging_decision.py CLI"
+  chat_return: "brief: pair, action, both prices, one-sentence rationale"

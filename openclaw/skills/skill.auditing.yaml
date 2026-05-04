@@ -1,0 +1,249 @@
+version: 1
+skill:
+  id: auditing
+  display_name: XBRL Numeric-Fact Audit Skill
+  description: >
+    Audits one XBRL numeric fact in an SEC-style filing. Compares the
+    reported (book) value from the instance document against the correct
+    (true) expected value derived from the filing's calculation linkbase,
+    US-GAAP taxonomy, and XBRL sign conventions. Cases A (summation
+    parent), B (directional concept), C (calculation child), D (no
+    relationships) classify the audit logic. Reads XBRL via the
+    `auditing_mcp` server and writes the result via the
+    `write_audit.py` CLI helper.
+  enabled: true
+  procedure_source: ../../.claude/skills/auditing/SKILL.md
+
+routing:
+  auto_invoke: true
+  priority: 88
+  stop_after_match: true
+  positive_triggers:
+    verbs:
+      - audit
+      - verify
+      - check
+      - compute calculated value
+      - derive reported value
+    nouns:
+      - XBRL
+      - filing
+      - 10-K
+      - 10-Q
+      - instance document
+      - calculation linkbase
+      - US-GAAP taxonomy
+      - concept
+      - reported value
+      - calculated value
+      - balance type
+    phrasings:
+      - "what is the reported value of X"
+      - "audit this concept"
+      - "check the filing math"
+      - "verify AssetsCurrent for FY2021"
+      - "audit us-gaap:..."
+  negative_triggers:
+    - trade
+    - trading decision
+    - pair trading
+    - hedging
+    - weekly report
+    - generate report
+    - evaluate reports
+
+model_selection:
+  preferred_provider: claude
+  preferred_model: claude-sonnet-4-6
+  allow_fallback: true
+  requires_capabilities:
+    - tool_calling
+    - mcp
+
+mcp_servers:
+  - id: auditing_mcp
+    command: python3
+    args:
+      - .claude/skills/auditing/scripts/mcp/auditing_mcp.py
+    env:
+      AUDITING_DATA_ROOT: ${AUDITING_DATA_ROOT:-./}
+    required: true
+
+tools:
+  - name: find_filing
+    mcp_server: auditing_mcp
+    signature: "(ticker, filing_name, issue_time) -> {filing_path, filing_year, files: {htm, cal, xsd, def, lab, pre}, found, message}"
+    purpose: >
+      Always call first. Resolves the filing folder under
+      `{data_root}/XBRL/`. `filing_path` and `filing_year` feed into
+      the other three tools. If `found == false`, stop and report.
+  - name: get_facts
+    mcp_server: auditing_mcp
+    signature: "(filing_path, concept_id, period) -> {matched, all_periods_found}"
+    purpose: >
+      Extract numeric facts whose context period exactly matches `period`.
+      Use `matched[0]` (non-dimensional first) as the reported value.
+      `all_periods_found` helps diagnose period misses.
+  - name: get_calculation_network
+    mcp_server: auditing_mcp
+    signature: "(filing_path, concept_id) -> {as_parent: [{child, weight, role}], as_child: {parent, siblings, role}, is_isolated}"
+    purpose: >
+      Classify the concept's role in the filing's calculation linkbase.
+      `as_parent` non-empty -> Case A. `as_child` non-empty -> Case C.
+      `is_isolated == true` -> Case D.
+  - name: get_concept_metadata
+    mcp_server: auditing_mcp
+    signature: "(filing_path, concept_id, taxonomy_year) -> {balance, period_type, label, is_directional_hint}"
+    purpose: >
+      `balance` ∈ {debit, credit, none, unknown}. `is_directional_hint`
+      true -> Case B (force positive absolute). Pass `taxonomy_year`
+      from `find_filing.filing_year`.
+
+scripts:
+  - name: write_audit
+    path: .claude/skills/auditing/scripts/write_audit.py
+    invocation: >
+      python3 .claude/skills/auditing/scripts/write_audit.py
+      --filing-name {FILING_NAME} --ticker {TICKER} --issue-time {ISSUE_TIME}
+      --concept-id {CONCEPT_ID} --period {PERIOD}
+      --reported-value {REPORTED} --calculated-value {CALCULATED}
+      --case {A|B|C|D} [--notes {NOTES}]
+      --agent-name {AGENT} --model {MODEL}
+    purpose: >
+      Writes a single-line JSON record to results/auditing/. Owns
+      filename sanitization and dir creation; the agent never writes
+      JSON inline.
+
+input_schema:
+  required:
+    - ticker
+    - filing_name
+    - issue_time
+    - concept_id
+    - period
+  optional:
+    - agent_name
+    - model_name
+  examples:
+    ticker: rrr
+    filing_name: "10k"
+    issue_time: "20231231"
+    concept_id: "us-gaap:AssetsCurrent"
+    period: "2023-01-01 to 2023-12-31"
+  defaults:
+    agent_name: "${OPENCLAW_AGENT_NAME:-claude-code}"
+    model_name: "inherit from model_selection.preferred_model"
+  field_rules:
+    ticker: "lowercase as it appears in folder names"
+    filing_name: "lowercase ('10k' or '10q')"
+    issue_time: "format YYYYMMDD"
+    concept_id: "exact concept QName, colon or underscore form (server normalizes)"
+    period: "instant 'YYYY-MM-DD' | duration 'YYYY-MM-DD to YYYY-MM-DD' | 'FY2023' | 'Q3 2023'"
+
+output_artifacts:
+  - kind: single_line_json
+    path_template: "results/auditing/{agent_name}_auditing_{filing_name}_{ticker}_{issue_time}_{model}.json"
+    written_by: write_audit.py
+    record_schema:
+      filing_name: string
+      ticker: string
+      issue_time: "YYYYMMDD"
+      concept_id: string
+      period: string
+      reported_value: "string (preserve exact numeric form)"
+      calculated_value: "string"
+      case: "A | B | C | D"
+      notes: "optional explanation"
+
+constraints:
+  always_find_filing_first:
+    rule: "Every audit must call find_filing first. filing_path threads through all subsequent tool calls."
+  case_classification:
+    rule: >
+      Cases are not mutually exclusive. A and B can both apply: if
+      both, calculated_value = abs(weighted-sum-of-children). Case C
+      uses parent + siblings to derive algebraically. Case D returns
+      reported value as-is.
+  period_grammar:
+    rule: >
+      `get_facts` accepts: instant 'YYYY-MM-DD'; duration
+      'YYYY-MM-DD to YYYY-MM-DD'; 'FY{year}' (calendar year only);
+      'Q{1-4} {year}' (calendar quarter). Non-calendar fiscal years
+      must use the explicit duration form.
+  no_inline_json:
+    rule: "Output JSON is written by write_audit.py, never inline."
+  no_xml_parsing_by_agent:
+    rule: "Do not parse the XBRL XML directly. All file access goes through MCP tools."
+
+behavior_rules:
+  - Always start with find_filing; never hardcode filing paths.
+  - Use `get_calculation_network.as_parent` for Case A children with weights and contextRef matching to the parent fact.
+  - Use `get_concept_metadata.balance` and `is_directional_hint` to detect Case B (directional concepts: force positive absolute).
+  - When matched is empty, inspect `all_periods_found` and reconsider the period expression before declaring a miss.
+  - Concept-id normalization (colon vs underscore) is handled server-side; pass either form.
+  - The output is a single JSON line; do not add commentary or Markdown fences.
+  - Do not create temporary scripts, debug logs, or intermediate files. write_audit.py owns all output I/O.
+
+procedure:
+  - step: 1
+    name: find_filing
+    description: Call find_filing(ticker, filing_name, issue_time). Stop if not found.
+  - step: 2
+    name: get_facts
+    description: Call get_facts(filing_path, concept_id, period). Pick matched[0] as reported_value. If empty, diagnose via all_periods_found.
+  - step: 3
+    name: classify_concept
+    description: Call get_calculation_network(filing_path, concept_id) and get_concept_metadata(filing_path, concept_id, filing_year) to determine the case (A/B/C/D).
+  - step: 4
+    name: compute_calculated
+    description: >
+      Apply the case logic. A summation = weighted sum of children with
+      same context. B forces abs(value). C derives from parent and
+      siblings. D copies the reported value.
+  - step: 5
+    name: write
+    description: Run write_audit.py with reported, calculated, case, optional notes, agent, and model.
+
+prompt_template: |
+  You are the XBRL numeric-fact auditing skill. Audit one fact in one
+  filing, classify the case (A/B/C/D), and write the result via
+  write_audit.py.
+
+  Canonical procedure: {procedure_source}
+
+  Inputs:
+    ticker        = {ticker}
+    filing_name   = {filing_name}      (10k or 10q)
+    issue_time    = {issue_time}       (YYYYMMDD)
+    concept_id    = {concept_id}
+    period        = {period}
+    agent_name    = {agent_name}
+    model         = {model_name}
+
+  MCP tools on `auditing_mcp`:
+    - find_filing(ticker, filing_name, issue_time)             [call first]
+    - get_facts(filing_path, concept_id, period)
+    - get_calculation_network(filing_path, concept_id)
+    - get_concept_metadata(filing_path, concept_id, taxonomy_year)
+
+  Hard rules:
+    1. Always call find_filing first; thread filing_path / filing_year.
+    2. Cases A and B can stack: if both, calculated_value = abs(sum).
+    3. Concept-id colon/underscore form both accepted server-side.
+    4. Output is one JSON line written by write_audit.py — never inline.
+    5. Do not parse XBRL XML directly.
+
+  Output via:
+    python3 .claude/skills/auditing/scripts/write_audit.py
+        --filing-name {filing_name} --ticker {ticker}
+        --issue-time {issue_time} --concept-id {concept_id}
+        --period {period}
+        --reported-value <REPORTED> --calculated-value <CALCULATED>
+        --case <A|B|C|D> [--notes <NOTES>]
+        --agent-name {agent_name} --model {model_name}
+
+output:
+  format: json_one_line
+  primary_artifact: "results/auditing/{agent_name}_auditing_{filing_name}_{ticker}_{issue_time}_{model}.json"
+  write_strategy: "via write_audit.py CLI"
+  chat_return: "brief statement of reported / calculated / case + one-sentence rationale"
