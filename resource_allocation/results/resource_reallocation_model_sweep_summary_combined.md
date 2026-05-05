@@ -1,7 +1,0 @@
-| Model | Cases | Completed | Errors | Valid Plans | Avg Score |
-|---|---:|---:|---:|---:|---:|
-| `anthropic/claude-3.5-haiku` | 13 | 13 | 0 | 11 | 65.82 |
-| `google/gemma-4-26b-a4b-it` | 13 | 13 | 0 | 13 | 73.86 |
-| `nvidia/nemotron-nano-9b-v2` | 13 | 13 | 0 | 11 | 63.87 |
-| `openai/gpt-oss-20b` | 13 | 13 | 0 | 13 | 71.90 |
-| `qwen/qwen-plus-2025-07-28` | 13 | 13 | 0 | 12 | 67.17 |
