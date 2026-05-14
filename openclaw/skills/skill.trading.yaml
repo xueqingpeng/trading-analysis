@@ -1,0 +1,347 @@
+version: 1
+skill:
+  id: trading
+  display_name: Single-Day Trading Decision Skill
+  description: >
+    Makes a single daily BUY/SELL/HOLD decision for one symbol on a given
+    target_date by querying an offline DuckDB via the `trading_mcp` server.
+    One (symbol, target_date) pair per invocation. Result is upserted into a
+    per-symbol action-list JSON file. The caller drives replay (loop over
+    historical dates) or live trading (pass today, or omit the date to use
+    the latest DuckDB date).
+  enabled: true
+  procedure_source: ../../.claude/skills/trading/SKILL.md
+
+routing:
+  auto_invoke: true
+  priority: 90
+  stop_after_match: true
+  positive_triggers:
+    verbs:
+      - trade
+      - decide
+      - make trading decision
+      - run trading
+      - run trading step
+      - live trading
+      - BUY
+      - SELL
+      - HOLD
+    nouns:
+      - trading decision
+      - daily decision
+      - action list
+      - single-stock decision
+    symbols:
+      - AAPL
+      - ADBE
+      - AMZN
+      - GOOGL
+      - META
+      - MSFT
+      - NVDA
+      - TSLA
+    phrasings:
+      - "trade X on YYYY-MM-DD"
+      - "decide X today"
+      - "run trading for X YYYY-MM-DD"
+      - "trade X"
+  negative_triggers:
+    - pair trading
+    - portfolio optimization
+    - weekly report
+    - generate report
+    - equity research
+    - audit filing
+    - evaluate reports
+
+model_selection:
+  preferred_provider: claude
+  preferred_model: claude-sonnet-4-6
+  allow_fallback: true
+  requires_capabilities:
+    - tool_calling
+    - mcp
+
+mcp_servers:
+  - id: trading_mcp
+    command: python3
+    args:
+      - .claude/skills/trading/scripts/mcp/trading_mcp.py
+    env:
+      TRADING_DB_PATH: ${TRADING_DB_PATH:-./env.duckdb}
+    required: true
+
+tools:
+  # Preferred compact tools — keep individual results small so they fit under
+  # the Claude Code CLI inline-result size limit. Use list_* first, then pull
+  # details on demand with the get_* variants.
+  - name: is_trading_day
+    mcp_server: trading_mcp
+    preferred: true
+    signature: "(symbol, target_date) -> {symbol, date, is_trading_day, reason, prev_trading_day, prev_trading_day_adj_close, latest_date_in_db, should_upsert}"
+    purpose: >
+      First call every day. Replaces weekday check + missing-row check +
+      get_latest_date in one call. `reason` is one of
+      `trading_day` / `weekend` / `holiday` / `not_loaded`.
+  - name: get_prices
+    mcp_server: trading_mcp
+    signature: "(symbol, date_start, date_end) -> rows[{symbol, date, open, high, low, close, adj_close, volume}]"
+    purpose: OHLCV rows; `adj_close` is the canonical trading price.
+  - name: list_news
+    mcp_server: trading_mcp
+    preferred: true
+    signature: "(symbol, date_start, date_end) -> rows[{symbol, date, id, title, url}]"
+    purpose: >
+      Compact news metadata, no highlights. Use to scan headlines and pick
+      which ids are worth fully reading.
+  - name: get_news_by_id
+    mcp_server: trading_mcp
+    preferred: true
+    signature: "(symbol, id) -> {symbol, date, id, title, url, highlights}"
+    purpose: Fetch one full article after filtering with list_news.
+  - name: list_filings
+    mcp_server: trading_mcp
+    preferred: true
+    signature: "(symbol, date_start, date_end, document_type?) -> rows[{symbol, date, document_type, mda_chars, risk_chars}]"
+    purpose: >
+      Compact filing metadata with character counts only. Use to decide
+      whether to fetch a section (and which one).
+  - name: get_filing_section
+    mcp_server: trading_mcp
+    preferred: true
+    signature: "(symbol, date, document_type, section, offset=0, limit=None) -> {content, total_chars, offset, returned_chars, has_more, ...}"
+    purpose: >
+      Fetch one section ('mda' or 'risk') of a specific filing. Omit
+      `limit` for the whole section, or paginate with `offset/limit` for
+      long sections.
+  - name: get_indicator
+    mcp_server: trading_mcp
+    signature: "(symbol, date_start, date_end, indicator, length?) -> rows"
+    purpose: Technical indicators computed from the prices table (ma / rsi / bbands / macd). Optional.
+    notes: >
+      ma default length 20, rsi default 14, bbands default 20 with stddev=2,
+      macd uses fixed 12/26/9 and ignores length. Computed from adj_close.
+      The server auto-fetches warmup history before date_start internally.
+  # NOTE: bulk variants get_news / get_filings / get_latest_date were removed
+  # in `final_trading` (claude-agent-sdk branch). The 7 tools above are the
+  # complete public surface.
+
+scripts:
+  # Small CLI helpers invoked via the Bash tool; keep inline Python out of the
+  # skill and keep tool-call results compact.
+  - name: upsert_decision
+    path: .claude/skills/trading/scripts/upsert_decision.py
+    invocation: >
+      python3 .claude/skills/trading/scripts/upsert_decision.py
+      --symbol {SYMBOL} --target-date {TARGET_DATE}
+      --price {PRICE_TODAY} --action {BUY|SELL|HOLD}
+      --model {MODEL}
+    purpose: >
+      Owns all output-file I/O (load-or-create, sanitize filename, upsert by
+      date, sort, recompute start_date/end_date, write JSON). The skill does
+      not write JSON inline.
+  - name: date_offset
+    path: .claude/skills/trading/scripts/date_offset.py
+    invocation: >
+      python3 .claude/skills/trading/scripts/date_offset.py {TARGET_DATE}
+      {DAYS} [{DAYS} ...]
+    purpose: >
+      Prints `TARGET_DATE - N days` per arg, one per line. Saves the agent
+      from doing datetime math inline for the common N-days-back windows.
+
+input_schema:
+  required:
+    - symbol
+  optional:
+    - target_date
+    - agent_name
+    - model_name
+  symbols_whitelist:
+    - AAPL
+    - ADBE
+    - AMZN
+    - GOOGL
+    - META
+    - MSFT
+    - NVDA
+    - TSLA
+  date_format: "YYYY-MM-DD"
+  defaults:
+    target_date: "get_latest_date(symbol)"
+    agent_name: "${OPENCLAW_AGENT_NAME:-claude-code}"
+    model_name: "inherit from model_selection.preferred_model"
+
+context_packing:
+  include_in_order:
+    - skill_procedure
+    - symbol
+    - target_date
+    - recent_prices
+    - recent_news
+    - relevant_filings
+    - optional_indicators
+  max_context_chars: 48000
+  truncation_policy: keep_target_date_row_and_most_recent_context
+
+output_artifacts:
+  - kind: upsert_json
+    path_template: "results/trading/trading_{SYMBOL}_{agent_name}_{model}.json"
+    key: date
+    record_schema:
+      date: "YYYY-MM-DD"
+      price: "adj_close (float)"
+      recommended_action:
+        enum: [BUY, SELL, HOLD]
+    document_shape:
+      status:
+        enum: [in_progress, completed]
+        written_by_skill: in_progress
+        written_by_caller: completed
+      symbol: string
+      agent: string
+      model: string
+      start_date: string
+      end_date: string
+      recommendations: array
+    filename_sanitization:
+      rule: "replace any character that is not alphanumeric, '-', or '_' with '_'"
+      lowercase: [model]
+
+constraints:
+  no_look_ahead:
+    description: "date_end (and any news/filing date) must be <= target_date for every MCP call."
+    applies_to: [get_prices, list_news, get_news_by_id, list_filings, get_filing_section, get_indicator, get_news, get_filings]
+  non_trading_day_forced_hold:
+    description: >
+      When is_trading_day returns `reason == 'weekend'` or `reason ==
+      'holiday'`, force action = HOLD, set price_today =
+      prev_trading_day_adj_close, and skip directly to the upsert. Do not
+      call any other data tool.
+    on_trigger:
+      - skip get_prices / list_news / list_filings / get_indicator
+      - set price_today = prev_trading_day_adj_close from is_trading_day
+      - briefly note the non-trading day to the user
+  not_loaded_stop:
+    description: >
+      When is_trading_day returns `reason == 'not_loaded'` (target_date
+      beyond latest_date_in_db), stop and report to the user. Do not run
+      upsert_decision.py. Do not fabricate a decision.
+  inline_result_size_limit:
+    description: >
+      The Claude Code CLI has an inline-result size limit. Prefer
+      list_news + get_news_by_id over get_news, and list_filings +
+      get_filing_section over get_filings. Paginate long sections via
+      offset/limit.
+  single_pair_per_invocation:
+    description: "Exactly one (symbol, target_date) per invocation."
+
+behavior_rules:
+  - All market data comes from MCP tools on the `trading_mcp` server. Never read parquet files directly.
+  - Every MCP call must have date_end (and filing / news date) <= target_date. No look-ahead.
+  - Call `is_trading_day` first every day. It replaces weekday + missing-row + get_latest_date in one call.
+  - Prefer list_news + get_news_by_id over get_news, and list_filings + get_filing_section over get_filings. Bulk variants can exceed the CLI inline-result size limit.
+  - HOLD is mandatory when `is_trading_day.reason` is `weekend` or `holiday`.
+  - Stop and report when `is_trading_day.reason` is `not_loaded`; do not run upsert_decision.py.
+  - Write the decision by invoking `upsert_decision.py` via Bash, not by writing JSON inline.
+  - Leave status = "in_progress". The caller decides when to mark completed.
+  - recommended_action must be exactly "BUY", "SELL", or "HOLD".
+  - Price saved in the upsert record is the adj_close from the target_date row (or prev_trading_day_adj_close on a weekend/holiday).
+  - Do not emit intermediate scripts, debug logs, or partial output files.
+
+procedure:
+  - step: 1
+    name: is_trading_day
+    description: >
+      Always the first call. `is_trading_day(symbol, target_date)` returns
+      `reason` in {trading_day, weekend, holiday, not_loaded} plus
+      prev_trading_day_adj_close and latest_date_in_db. Branch:
+      weekend/holiday → force HOLD with price_today =
+      prev_trading_day_adj_close and jump to step 6.
+      not_loaded → stop and report, do not upsert.
+      trading_day → continue.
+  - step: 2
+    name: fetch_prices
+    description: >
+      `get_prices(symbol, target_date - 30 days, target_date)` for recent
+      ~1 month of OHLCV. price_today = adj_close of the row where date ==
+      target_date.
+  - step: 3
+    name: scan_then_fetch_news
+    description: >
+      `list_news(symbol, target_date - 7 days, target_date)` to scan
+      headlines. For each id whose title looks relevant, call
+      `get_news_by_id(symbol, id)` to pull its highlights. Skip the rest
+      to keep results compact.
+  - step: 4
+    name: optionally_filings_and_indicators
+    description: >
+      If warranted, `list_filings(symbol, target_date - 1y, target_date)`
+      then `get_filing_section(..., section='mda'|'risk', offset, limit)`
+      paginated as needed. Optionally `get_indicator` for ma/rsi/bbands/macd.
+  - step: 5
+    name: decide
+    description: >
+      Weigh OHLCV trend, news (title + highlights for those fetched),
+      filings sections, and any indicators to pick BUY | SELL | HOLD.
+  - step: 6
+    name: upsert
+    description: >
+      Invoke `python3 .claude/skills/trading/scripts/upsert_decision.py`
+      via Bash with `--symbol --target-date --price --action --model`.
+      The script owns all output-file I/O.
+
+prompt_template: |
+  You are the single-day trading decision skill. Make exactly one
+  BUY / SELL / HOLD decision for symbol `{symbol}` on `{target_date}` using
+  only the offline DuckDB exposed by the `trading_mcp` MCP server.
+
+  Canonical procedure is documented at: {procedure_source}
+
+  Inputs:
+    symbol       = {symbol}
+    target_date  = {target_date}
+    agent_name   = {agent_name}
+    model        = {model_name}
+
+  MCP tools on `trading_mcp` (prefer the [preferred] ones; bulk variants
+  can blow past the CLI inline-result size limit):
+    - is_trading_day(symbol, target_date)                        [preferred, call first]
+    - get_prices(symbol, date_start, date_end)
+    - list_news(symbol, date_start, date_end)                    [preferred]
+    - get_news_by_id(symbol, id)                                 [preferred]
+    - list_filings(symbol, date_start, date_end, document_type?) [preferred]
+    - get_filing_section(symbol, date, document_type, section, offset=0, limit=None) [preferred]
+    - get_indicator(symbol, date_start, date_end, indicator, length?)
+    - get_news / get_filings / get_latest_date                   [deprecated, for compat]
+
+  Hard rules:
+    1. Always call is_trading_day first. Branch on `reason`:
+         weekend / holiday  → HOLD, price_today = prev_trading_day_adj_close,
+                              skip to upsert.
+         not_loaded         → stop and report, do not upsert.
+         trading_day        → continue.
+    2. Never query any tool with a date beyond target_date.
+    3. Never read parquet directly. All data from `trading_mcp`.
+    4. Use list_news + get_news_by_id and list_filings + get_filing_section;
+       avoid the bulk variants unless you know the result will be small.
+    5. Write the decision via
+         python3 .claude/skills/trading/scripts/upsert_decision.py
+            --symbol {SYMBOL} --target-date {TARGET_DATE}
+            --price {PRICE_TODAY} --action {BUY|SELL|HOLD} --model {MODEL}
+       Do NOT write the JSON inline.
+
+  Output record written by upsert_decision.py:
+    {"date": "{target_date}", "price": <adj_close float>, "recommended_action": "BUY"|"SELL"|"HOLD"}
+  Document status is left as "in_progress".
+
+  Keep user-facing commentary brief.
+
+output:
+  format: json
+  primary_artifact: "results/trading/trading_{SYMBOL}_{agent_name}_{model}.json"
+  write_strategy: "call upsert_decision.py via Bash; the script owns all file I/O"
+  side_effects:
+    - upsert one record keyed by date into the artifact above
+    - leave document status as "in_progress"
+  chat_return: "brief confirmation of action taken and target_date"
